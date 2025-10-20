@@ -5,15 +5,17 @@
 // @description  View and track Torn stock BUY/SELL logs (7, 14, or 45 days) with profit/loss calculations using your own local API data.
 // @author       Eaglewing [571041]
 // @license      MIT
-// @match        https://www.torn.com/stockexchange.php*
-// @match        https://www.torn.com/page.php*
 // @match        https://www.torn.com/*
 // @icon         https://www.torn.com/favicon.ico
-// @grant        none
+// @run-at       document-idle
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_notification
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // @downloadURL  https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // ==/UserScript==
-
 
 (function () {
   'use strict';
@@ -662,5 +664,6 @@
     }
   });
 
+  // Show only on the Stocks page, plus add a launcher there
   if (onStocksPage()) { createPanel(); addLauncher(); }
 })();
