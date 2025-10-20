@@ -1,17 +1,19 @@
 // ==UserScript==
 // @name         Torn Day Trader Logbook (Experimental)
-// @namespace    https://torn.com/
-// @version      1.0.4-exp
-// @description  Draggable panel for Torn stocks showing BUY/SELL logs (5510/5511) for 7/14/45 days. Sticky position, loading bar, average-cost ledger, tickers. Columns: Buy Price, Sell Price, Shares, Gross (Sell), Fee (0.10%), Total Buy, Total Sell, Profit. BUY rows show “N/A” in Total Sell and “—” in Gross (Sell). Click rows to highlight (Ctrl/Cmd). Inline manual BUY price for old SELLs (>45D). Requires Full Access API key. Made by Eaglewing [571041].
-// @match        https://www.torn.com/page.php?sid=stocks*
-// @run-at       document-idle
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_addStyle
-// @grant        GM_registerMenuCommand
-// @grant        GM_notification
+// @namespace    https://github.com/Eaglewing91
+// @version      1.0.4
+// @description  View and track Torn stock BUY/SELL logs (7, 14, or 45 days) with profit/loss calculations using your own local API data.
+// @author       Eaglewing [571041]
 // @license      MIT
+// @match        https://www.torn.com/stockexchange.php*
+// @match        https://www.torn.com/page.php*
+// @match        https://www.torn.com/*
+// @icon         https://www.torn.com/favicon.ico
+// @grant        none
+// @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
+// @downloadURL  https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // ==/UserScript==
+
 
 (function () {
   'use strict';
