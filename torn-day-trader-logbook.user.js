@@ -1,20 +1,16 @@
 // ==UserScript==
 // @name         Torn Day Trader Logbook (Experimental)
-// @namespace    https://github.com/Eaglewing91
-// @version      1.0.4
-// @description  View and track Torn stock BUY/SELL logs (7, 14, or 45 days) with profit/loss calculations using your own local API data.
-// @author       Eaglewing [571041]
-// @license      MIT
-// @match        https://www.torn.com/*
-// @icon         https://www.torn.com/favicon.ico
+// @namespace    https://torn.com/
+// @version      1.1.2-exp
+// @description  Draggable panel for Torn stocks with incremental cache + accurate carried-in opening lots from cached logs only (no manual baseline). Tracks BUY/SELL (5510/5511). Rate-limit safe (throttle + exponential backoff + progressive crawl with resume cursor). Panel persists, inline manual buy editor, test key, progress bar. Made by Eaglewing [571041].
+// @match        https://www.torn.com/page.php?sid=stocks*
 // @run-at       document-idle
-// @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
-// @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
-// @downloadURL  https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
+// @license      MIT
 // ==/UserScript==
 
 (function () {
@@ -24,17 +20,31 @@
   const API_BASE = 'https://api.torn.com';
   const TITLE = 'Torn Day Trader Logbook';
 
-  const KEY_API        = 'tdtl_api_key_v101exp';
-  const KEY_LAST_RANGE = 'tdtl_last_range_v101exp';  // '7' | '14' | '45'
-  const KEY_STOCK_MAP  = 'tdtl_stock_map_v101exp';   // cache: stock id -> acronym/name
-  const KEY_POS        = 'tdtl_panel_pos_v101exp';   // { left, top }
-  const KEY_MANUAL     = 'tdtl_manual_buys_v103exp'; // { [sellLogId]: { buyPrice:number, ts:number } }
+  const KEY_API        = 'tdtl_api_key_v112exp';
+  const KEY_LAST_RANGE = 'tdtl_last_range_v112exp';  // '7' | '14' | '45'
+  const KEY_STOCK_MAP  = 'tdtl_stock_map_v112exp';   // cache: stock id -> {acronym,name}
+  const KEY_POS        = 'tdtl_panel_pos_v112exp';   // { left, top }
+  const KEY_MANUAL     = 'tdtl_manual_buys_v112exp'; // { [sellLogId]: { buyPrice:number, ts:number } }
 
-  const MAX_PAGES = 350;
-  const MAX_LOGS  = 50000;
+  // Incremental + logs + ledger + cursor caches (no baselines)
+  const KEY_LEDGER     = 'tdtl_ledger_cache_v112exp'; // { last_ts:number|null, byStockId:{ [id]:{ shares:number, cost:number } } }
+  const KEY_LOGS       = 'tdtl_logs_cache_v112exp';   // { last_ts:number|null, byId:{ [logId]: RawLog }, idsAsc:string[] }
+  const KEY_CURSOR     = 'tdtl_cursor_v112exp';       // { from:number, to:number, cursorTo:number|null }
 
-  const TYPE_BUY   = 5510;
-  const TYPE_SELL  = 5511;
+  const MAX_LOGS_FETCH = 50000;   // per progressive run
+  const LOGS_CAP_IDS   = 500000;  // very high local cache cap; effectively "permanent" for normal use
+
+  // Progressive crawl + rate guard
+  const MAX_PAGES_PER_PULL = 60;     // stop each run after ~60 pages to stay safe
+  const SAFETY_SLEEP_MS    = 2000;   // small breather between pages
+
+  // Bootstrap depth for the very first run (to seed cache)
+  const RANGE_BOOTSTRAP_MULTIPLIER = 2;
+  const BOOTSTRAP_HARDCAP_DAYS     = 21;
+
+  // ---- Global throttle (≈1.3s/request ≈ ~45/min) ----
+  let _lastReqAt = 0;
+  const MIN_GAP_MS = 1300; // bump to 1500 if you still see 429s
 
   // ------------------ Utils -------------------
   const s = (x) => (x == null ? '' : String(x));
@@ -57,24 +67,41 @@
     : '—';
   const intFmt = (n)=> (typeof n==='number' && isFinite(n)) ? n.toLocaleString(undefined) : '—';
 
-  // Manual cache helpers
-  function getManualMap(){
-    const obj = GM_getValue(KEY_MANUAL, {});
-    if (obj && typeof obj === 'object') return obj;
-    return {};
-  }
+  // ------------------ Persistent helpers -------------------
+  function getJSON(key, fallback){ try { const v = GM_getValue(key, null); return (v && typeof v==='object') ? v : (fallback ?? null); } catch { return (fallback ?? null); } }
+  function setJSON(key, obj){ GM_setValue(key, obj); }
+
+  function getManualMap(){ return getJSON(KEY_MANUAL, {}) || {}; }
   function setManualBuy(sellLogId, buyPrice){
     const map = getManualMap();
-    if (buyPrice == null || !isFinite(buyPrice) || buyPrice <= 0) {
-      delete map[sellLogId];
-    } else {
-      map[sellLogId] = { buyPrice: Number(buyPrice), ts: unixNow() };
+    if (buyPrice == null || !isFinite(buyPrice) || buyPrice <= 0) delete map[sellLogId];
+    else map[sellLogId] = { buyPrice: Number(buyPrice), ts: unixNow() };
+    setJSON(KEY_MANUAL, map);
+  }
+  function clearAllManual(){ setJSON(KEY_MANUAL, {}); }
+
+  // Ledger cache
+  function getLedger(){ return getJSON(KEY_LEDGER, { last_ts:null, byStockId:{} }) || { last_ts:null, byStockId:{} }; }
+  function saveLedger(ledger){ setJSON(KEY_LEDGER, ledger); }
+
+  // Logs cache: { last_ts, byId, idsAsc }
+  function getLogs(){
+    const v = getJSON(KEY_LOGS, null);
+    if (v && typeof v==='object' && v.byId && v.idsAsc) return v;
+    return { last_ts:null, byId:{}, idsAsc:[] };
+  }
+  function saveLogs(logs){
+    if (logs.idsAsc.length > LOGS_CAP_IDS) {
+      const drop = logs.idsAsc.length - LOGS_CAP_IDS;
+      const toDrop = logs.idsAsc.splice(0, drop);
+      for (const id of toDrop) delete logs.byId[id];
     }
-    GM_setValue(KEY_MANUAL, map);
+    setJSON(KEY_LOGS, logs);
   }
-  function clearAllManual(){
-    GM_setValue(KEY_MANUAL, {});
-  }
+
+  // Cursor cache
+  function getCursor(){ return getJSON(KEY_CURSOR, null); }
+  function saveCursor(obj){ setJSON(KEY_CURSOR, obj); }
 
   // ------------------ Styles ------------------
   GM_addStyle(`
@@ -95,7 +122,7 @@
       background:linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd)}
     @keyframes tdtl-indeterminate{0%{left:-40%}100%{left:100%}}
     .tdtl-progress.active .tdtl-progress-bar{animation:tdtl-indeterminate 1.15s linear infinite}
-    .tdtl-body{overflow:auto;max-height:calc(82vh - 206px)}
+    .tdtl-body{overflow:auto;max-height:calc(82vh - 240px)}
     .tdtl-summary{padding:8px 12px;background:#0e141d;border-bottom:1px solid #2b2f36;display:flex;gap:16px;flex-wrap:wrap}
     .tdtl-summary .card{background:#10151d;border:1px solid #2b2f36;border-radius:8px;padding:8px 10px;min-width:160px}
     .tdtl-table{width:100%;border-collapse:collapse;font-size:13.5px;color:#ffffff}
@@ -115,7 +142,6 @@
     .tdtl-credit{opacity:.85}
     .tdtl-close{margin-left:10px}
     .tdtl-launcher{position:fixed;top:84px;right:20px;z-index:999998}
-    /* Buy cell layout */
     .tdtl-buycell{white-space:nowrap;}
     .tdtl-buywrap{display:inline-flex;align-items:center;gap:6px;}
     .tdtl-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1px solid #4a5a76;border-radius:6px;background:#1f2a3a;cursor:pointer;font-size:11px;line-height:1}
@@ -123,9 +149,10 @@
     .tdtl-tag{display:inline-block;font-size:10px;padding:2px 6px;border:1px solid #4a5a76;border-radius:999px;opacity:0.9}
     .tdtl-inline-editor{display:inline-flex;align-items:center;gap:6px;}
     .tdtl-inline-editor input{width:90px;background:#0b0e13;color:#fff;border:1px solid #2b2f36;border-radius:6px;padding:4px 6px;font-size:12px;}
+    .tdtl-mini{font-size:11px;opacity:.9;margin-left:8px}
   `);
 
-  // ------------------ Drag (with position save) --------------------
+  // ------------------ Drag --------------------
   function makeDraggable(handle, container, onStop) {
     let start = null, base = null, dragging = false;
     handle.addEventListener('mousedown', e => {
@@ -173,17 +200,31 @@
     el.style.position = 'fixed';
   }
 
-  // ------------------ HTTP --------------------
+  // ------------------ Rate gate + HTTP --------------------
+  async function rateGate() {
+    const now = Date.now();
+    const wait = Math.max(0, _lastReqAt + MIN_GAP_MS - now);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    _lastReqAt = Date.now();
+  }
+  const jitter = (m) => Math.floor(Math.random() * m);
+
   async function fetchJSON(url, attempt = 0) {
+    await rateGate();
+
     const r = await fetch(url, { cache: 'no-store' });
+    let data = null; try { data = await r.json(); } catch {}
+
     if (r.status === 429 || r.status === 503) {
-      const backoff = Math.min(2000 * (attempt + 1), 8000);
+      const base = Math.min(30000, 1000 * Math.pow(2, attempt)); // 1s→2s→4s→...≤30s
+      const backoff = base + jitter(1200);
       await new Promise(res => setTimeout(res, backoff));
       return fetchJSON(url, attempt + 1);
     }
-    let data = null; try { data = await r.json(); } catch {}
+
     return { status: r.status, data };
   }
+
   const buildURL = (section, params) => `${API_BASE}/${section}/?${new URLSearchParams(params).toString()}`;
 
   // ------------------ Stock map (tickers) -----
@@ -203,13 +244,19 @@
     return {};
   }
 
-  // ------------------ Logs fetch --------------
-  async function fetchLogsWindow(key, from, to) {
-    let pages = 0, cursorTo = to, all = [], lastStatus = '';
-    while (pages < MAX_PAGES && all.length < MAX_LOGS) {
+  // ------------------ Logs fetch (progressive crawl) --------------
+  async function fetchLogsWindow(key, from, to, resumeTo = null) {
+    let pages = 0;
+    let cursorTo = resumeTo != null ? resumeTo : to;
+    let all = [];
+    let lastStatus = '';
+    let reachedFrom = false;
+
+    while (pages < MAX_PAGES_PER_PULL && all.length < MAX_LOGS_FETCH) {
       const url = buildURL('user', { selections: 'log', from, to: cursorTo, key });
       const { status, data } = await fetchJSON(url);
       lastStatus = `HTTP ${status}`;
+
       if (!data) break;
       if (data.error) throw new Error(`API error ${data.error.code}: ${data.error.error}`);
 
@@ -223,21 +270,25 @@
       all = all.concat(entries);
 
       const oldest = entries[entries.length - 1].timestamp;
-      if (oldest <= from) break;
+      if (oldest <= from) { reachedFrom = true; break; }
+
       cursorTo = oldest - 1;
       pages++;
+
+      await new Promise(r => setTimeout(r, SAFETY_SLEEP_MS));
     }
-    return { all, lastStatus };
+
+    return { all, lastStatus, nextCursorTo: reachedFrom ? null : cursorTo };
   }
 
   // ------------------ Extractors --------------
   function extractFields(entry) {
     const d = entry?.data || {};
-    const stockId = (typeof d.stock === 'number') ? d.stock : null;
+    const stockId = (typeof d.stock === 'number') ? String(d.stock) : (d.stock!=null ? String(d.stock) : null);
 
     let shares = null, gross = null, price = null;
     if (typeof d.amount === 'number') shares = d.amount;
-    if (typeof d.worth  === 'number') gross  = d.worth; // SELL (5511): Torn's NET
+    if (typeof d.worth  === 'number') gross  = d.worth; // Torn's net for SELLs
     if (d.price != null) {
       const p = (typeof d.price === 'number') ? d.price : parseFloat(d.price);
       if (!Number.isNaN(p) && Number.isFinite(p)) price = p;
@@ -248,48 +299,163 @@
     return { stockId, shares, gross, price };
   }
 
-  // ------------------ Ledger + Rows -----------
-  function buildLedgerAndRows(entries, stockMap, manualMap) {
-    const stockEntries = entries.filter(x => s(x.category || x.cat || '').toLowerCase().includes('stock'));
-    const tradeEvents = stockEntries
-      .map(x => {
-        const isNumeric = typeof x.log === 'number' || /^\d+$/.test(s(x.log));
-        const typeId = isNumeric ? Number(x.log) : null;
-        if (typeId !== TYPE_BUY && typeId !== TYPE_SELL) return null;
-        const f = extractFields(x);
-        if (f.shares == null || f.gross == null) return null;
-        const stockKey = f.stockId != null ? String(f.stockId) : '';
-        const ticker = stockKey ? (stockMap?.[stockKey]?.acronym || stockMap?.[stockKey] || stockKey) : '—';
+  // ------------------ Local cache: add logs + update ledger -----------
+  function appendLogsAndDedupe(logsCache, newEntriesAsc){
+    for (const e of newEntriesAsc) {
+      if (!logsCache.byId[e.id]) {
+        logsCache.byId[e.id] = e;
+        logsCache.idsAsc.push(e.id);
+      }
+    }
+    logsCache.idsAsc.sort((a,b)=> (logsCache.byId[a].timestamp - logsCache.byId[b].timestamp));
+    logsCache.last_ts = Math.max(logsCache.last_ts||0, newEntriesAsc.length ? newEntriesAsc[newEntriesAsc.length-1].timestamp : (logsCache.last_ts||0));
+  }
 
-        return {
-          id: x.id, ts: x.timestamp, when: asDate(x.timestamp),
-          action: typeId === TYPE_BUY ? 'BUY' : 'SELL',
-          ticker, shares: f.shares, price: f.price, gross: f.gross, raw: x, stockId: stockKey
-        };
-      })
-      .filter(Boolean)
-      .sort((a,b)=> a.ts - b.ts);
+  function applyToLedger(ledger, entriesAsc){
+    const byStock = ledger.byStockId;
+    for (const x of entriesAsc) {
+      const isNumeric = typeof x.log === 'number' || /^\d+$/.test(s(x.log));
+      const typeId = isNumeric ? Number(x.log) : null;
+      if (typeId !== 5510 && typeId !== 5511) continue;
+      const f = extractFields(x);
+      if (!f.stockId || f.shares == null || f.gross == null) continue;
+      if (!byStock[f.stockId]) byStock[f.stockId] = { shares:0, cost:0 };
 
-    const ledger = new Map(); // ticker -> { shares, cost }
-    const rows = [];
+      if (typeId === 5510) { // BUY
+        byStock[f.stockId].shares += f.shares;
+        byStock[f.stockId].cost   += f.gross;
+      } else { // SELL
+        const lot = byStock[f.stockId];
+        const avg = (lot.shares>0) ? (lot.cost/lot.shares) : null;
+        const reduceCost = (avg!=null) ? (avg * f.shares) : 0;
+        lot.shares = Math.max(0, lot.shares - f.shares);
+        lot.cost   = Math.max(0, lot.cost   - reduceCost);
+      }
+      ledger.last_ts = Math.max(ledger.last_ts||0, x.timestamp);
+    }
+    return ledger;
+  }
 
-    for (const ev of tradeEvents) {
-      const key = ev.ticker;
-      if (!ledger.has(key)) ledger.set(key, { shares: 0, cost: 0 });
-      const lot = ledger.get(key);
+  async function incrementalSync(key, desiredStartTs){
+    const ledger = getLedger();
+    const logsCache = getLogs();
 
-      if (ev.action === 'BUY') {
-        lot.shares += ev.shares;
-        lot.cost   += ev.gross;
-        rows.push({
-          ...ev,
-          fee: 0, net: null,
-          buyPrice: ev.price, sellPrice: null,
-          costTotal: ev.gross, profit: null, manual: false, editable: false
-        });
+    const to = unixNow();
+
+    const firstRun = !(ledger.last_ts && ledger.last_ts > 0);
+    let from = firstRun ? (desiredStartTs || daysAgoUnix(30)) : (ledger.last_ts + 1);
+
+    // Try to resume previous partial pull (same from/to)
+    const cur = getCursor();
+    let resumeTo = null;
+    if (cur && cur.from === from && cur.to === to) {
+      resumeTo = cur.cursorTo;
+    }
+
+    const { all, lastStatus, nextCursorTo } = await fetchLogsWindow(key, from, to, resumeTo);
+
+    if (all.length) {
+      const asc = all.slice().sort((a,b)=> a.timestamp - b.timestamp);
+      appendLogsAndDedupe(logsCache, asc);
+      applyToLedger(ledger, asc);
+      saveLogs(logsCache);
+      saveLedger(ledger);
+    }
+
+    if (nextCursorTo) saveCursor({ from, to, cursorTo: nextCursorTo });
+    else setJSON(KEY_CURSOR, null);
+
+    return { ledger, logsCache, fetched: all.length, status: lastStatus, partial: !!nextCursorTo };
+  }
+
+  // ------------------ Opening lots at range start (from cached logs only) ----
+  function computeOpeningLotsAt(startTs, stockMap){
+    const opening = {};
+    const cache = getLogs();
+    const ids = cache.idsAsc;
+
+    for (let i=0;i<ids.length;i++){
+      const e = cache.byId[ids[i]];
+      if (!e || e.timestamp > startTs) break;
+
+      const isNumeric = typeof e.log === 'number' || /^\d+$/.test(s(e.log));
+      const typeId = isNumeric ? Number(e.log) : null;
+      if (typeId !== 5510 && typeId !== 5511) continue;
+
+      const f = extractFields(e);
+      if (!f.stockId || f.shares == null || f.gross == null) continue;
+
+      if (!opening[f.stockId]) opening[f.stockId] = { shares:0, cost:0 };
+
+      if (typeId === 5510) {
+        opening[f.stockId].shares += f.shares;
+        opening[f.stockId].cost   += f.gross;
       } else {
-        const priceCents = Math.round((ev.price ?? 0) * 100);
-        const shares = Number(ev.shares ?? 0);
+        const lot = opening[f.stockId];
+        const avg = (lot.shares>0) ? (lot.cost/lot.shares) : null;
+        const reduceCost = (avg!=null) ? (avg * f.shares) : 0;
+        lot.shares = Math.max(0, lot.shares - f.shares);
+        lot.cost   = Math.max(0, lot.cost   - reduceCost);
+      }
+    }
+    const result = {};
+    for (const [sid, lot] of Object.entries(opening)) {
+      const shares = lot.shares||0;
+      const avg = shares>0 ? (lot.cost/shares) : null;
+      const ticker = stockMap?.[sid]?.acronym || sid;
+      result[sid] = { shares, avg, ticker };
+    }
+    return result;
+  }
+
+  // ------------------ Build rows for the chosen range -----------------
+  function buildRowsForRange(rangeStartTs, rangeEndTs, stockMap, manualMap){
+    const rows = [];
+    const opening = computeOpeningLotsAt(rangeStartTs, stockMap); // carried-in lots purely from cached history
+
+    const lotMap = {};
+    for (const [sid, o] of Object.entries(opening)) {
+      lotMap[sid] = { shares: o.shares||0, cost: (o.shares>0 && o.avg!=null) ? (o.shares*o.avg) : 0 };
+    }
+
+    const cache = getLogs();
+    const ids = cache.idsAsc;
+    const inRange = [];
+    for (let i=0;i<ids.length;i++){
+      const e = cache.byId[ids[i]];
+      if (!e) continue;
+      if (e.timestamp < rangeStartTs) continue;
+      if (e.timestamp > rangeEndTs) break;
+      inRange.push(e);
+    }
+    inRange.sort((a,b)=> a.timestamp - b.timestamp);
+
+    for (const x of inRange) {
+      const isNumeric = typeof x.log === 'number' || /^\d+$/.test(s(x.log));
+      const typeId = isNumeric ? Number(x.log) : null;
+      if (typeId !== 5510 && typeId !== 5511) continue;
+      const f = extractFields(x);
+      if (!f.stockId || f.shares == null || f.gross == null) continue;
+      const ticker = stockMap?.[f.stockId]?.acronym || f.stockId;
+
+      if (!lotMap[f.stockId]) lotMap[f.stockId] = { shares:0, cost:0 };
+
+      if (typeId === 5510) {
+        rows.push({
+          id: x.id, ts: x.timestamp, when: asDate(x.timestamp),
+          action: 'BUY', ticker, stockId:f.stockId,
+          shares: f.shares, price: f.price, gross: null,
+          fee: 0, net: null,
+          buyPrice: f.price, sellPrice: null,
+          costTotal: f.gross, profit: null, manual:false, editable:false
+        });
+
+        lotMap[f.stockId].shares += f.shares;
+        lotMap[f.stockId].cost   += f.gross;
+
+      } else {
+        const priceCents = Math.round((f.price ?? 0) * 100);
+        const shares = Number(f.shares ?? 0);
         const grossExactCents = priceCents * shares;
         const grossExact = grossExactCents / 100;
         const fee = Math.ceil(grossExact * 0.001);
@@ -297,31 +463,35 @@
         const net = Math.floor(netExact);
         const grossDisplay = net + fee;
 
+        const lot = lotMap[f.stockId];
         const currentAvg = (lot.shares > 0) ? (lot.cost / lot.shares) : null;
 
         let costTotal = null, profit = null, buyPriceOut = currentAvg, manualUsed = false, editable = false;
 
         if (currentAvg != null) {
-          costTotal = currentAvg * ev.shares;
-          profit = net - costTotal;
-          lot.shares -= ev.shares;
+          costTotal = currentAvg * shares;
+          profit    = net - costTotal;
+          lot.shares -= shares;
           lot.cost   -= costTotal;
           if (lot.shares < 0) { lot.shares = 0; lot.cost = 0; }
         } else {
-          const manual = manualMap && manualMap[ev.id];
+          const manual = manualMap && manualMap[x.id];
           if (manual && typeof manual.buyPrice === 'number' && isFinite(manual.buyPrice) && manual.buyPrice > 0) {
             buyPriceOut = manual.buyPrice;
-            costTotal   = manual.buyPrice * ev.shares;
+            costTotal   = manual.buyPrice * shares;
             profit      = net - costTotal;
             manualUsed  = true;
           } else {
-            editable = true;
+            editable = true; // allow user to supply when historic buys not cached (rare after warm-up)
           }
         }
 
         rows.push({
-          ...ev, gross: grossDisplay, fee, net,
-          buyPrice: buyPriceOut, sellPrice: ev.price,
+          id: x.id, ts: x.timestamp, when: asDate(x.timestamp),
+          action: 'SELL', ticker, stockId:f.stockId,
+          shares, price: f.price, gross: grossDisplay,
+          fee, net,
+          buyPrice: buyPriceOut, sellPrice: f.price,
           costTotal, profit, manual: manualUsed, editable
         });
       }
@@ -330,7 +500,7 @@
     return rows.sort((a,b)=> b.ts - a.ts);
   }
 
-  // ------------------ Render: Trades ----------
+  // ------------------ Render helpers ------------------
   function renderSummary(container, rows) {
     const sells = rows.filter(r => r.action === 'SELL');
     const totalBuy  = sells.reduce((a,r)=> a + (r.costTotal || 0), 0);
@@ -364,9 +534,9 @@
     });
   }
 
-  function renderTable(body, statusEl, rows, rawCount, stockCount, rangeDays) {
+  function renderTable(body, statusEl, rows, rangeDays) {
     if (!rows.length) {
-      body.innerHTML = `<div class="tdtl-empty">No BUY/SELL logs in the last ${rangeDays} day(s). (Pulled ${rawCount} → ${stockCount} stock logs)</div>`;
+      body.innerHTML = `<div class="tdtl-empty">No BUY/SELL logs in the last ${rangeDays} day(s).</div>`;
       statusEl.textContent = `Done.`;
       return;
     }
@@ -422,7 +592,6 @@
       tbody.appendChild(tr);
     }
 
-    // Enable clickable selection
     attachRowSelection(tbody);
 
     // Inline manual editor
@@ -469,7 +638,7 @@
         else if (ev.key === 'Escape') cancel();
       });
 
-      // Right-click on buy cell clears manual for that row
+      // Right-click clears manual for that row
       row.addEventListener('contextmenu', (ev)=>{
         if (!ev.target.closest('.tdtl-buycell')) return;
         ev.preventDefault();
@@ -490,7 +659,7 @@
     wrap.className = 'tdtl-wrap';
     wrap.innerHTML = `
       <div class="tdtl-header">
-        <div>${TITLE}</div>
+        <div>${TITLE} <span class="tdtl-mini">v1.1.2-exp (cached-only openings)</span></div>
         <div><button class="tdtl-btn tdtl-close" title="Close">✕</button></div>
       </div>
 
@@ -544,6 +713,7 @@
     const pullBtn = wrap.querySelector('#tdtl-pull');
     const testBtn = wrap.querySelector('#tdtl-test');
     const clearBtn = wrap.querySelector('#tdtl-clear-manual');
+
     clearBtn.addEventListener('click', () => {
       if (confirm('Clear ALL manually-set BUY prices for SELL rows?')) {
         clearAllManual();
@@ -552,57 +722,69 @@
       }
     });
 
-    let lastFetched = null;
+    let lastView = null;
+    let fetching = false;
+
     async function doPull() {
+      if (fetching) return;
+      fetching = true;
+      pullBtn.disabled = true;
+
       const rangeDays = parseInt(GM_getValue(KEY_LAST_RANGE, '7'), 10);
       const key = (keyInput.value || '').trim();
-      if (!key) return notify('Please paste your Full Access API key first.');
+      if (!key) {
+        notify('Please paste your Full Access API key first.');
+        fetching = false; pullBtn.disabled = false; return;
+      }
       GM_setValue(KEY_API, key);
 
       const to = unixNow();
-      const from = daysAgoUnix(rangeDays);
+      const fromRange = daysAgoUnix(rangeDays);
+      const ledger = getLedger();
 
-      body.innerHTML = `<div class="tdtl-empty">Pulling logs for last ${rangeDays} day(s)…</div>`;
-      statusEl.textContent = `Fetching ${new Date(from*1000).toLocaleDateString()} → ${new Date(to*1000).toLocaleDateString()}…`;
+      let bootstrapStart = null;
+      if (!ledger.last_ts) {
+        const days = Math.min(BOOTSTRAP_HARDCAP_DAYS, rangeDays * RANGE_BOOTSTRAP_MULTIPLIER);
+        bootstrapStart = daysAgoUnix(days);
+      }
+
+      body.innerHTML = `<div class="tdtl-empty">Syncing logs…</div>`;
+      statusEl.textContent = `Incremental pull ${bootstrapStart ? `(bootstrap ~${Math.round((to - bootstrapStart)/86400)}d)` : ''}…`;
       setLoading(true);
 
       try {
         const stockMap = await loadStockMap(key);
-        const { all, lastStatus } = await fetchLogsWindow(key, from, to);
-        statusEl.textContent = `Fetched ${all.length} log entries (${lastStatus}). Building ledger…`;
+        const sync = await incrementalSync(key, bootstrapStart);
+        statusEl.textContent = `Synced ${sync.fetched} log(s) (${sync.status})${sync.partial ? ' – paused to respect rate limits; click Pull Now again to continue' : ''}. Building view…`;
 
-        const stockEntries = all.filter(x => s(x.category || x.cat || '').toLowerCase().includes('stock'));
         const manualMap = getManualMap();
-        const rows = buildLedgerAndRows(all, stockMap, manualMap);
+        const rows = buildRowsForRange(fromRange, to, stockMap, manualMap);
 
-        lastFetched = { rows, allLogs: all, stockEntriesCount: stockEntries.length, rangeDays };
-        renderTable(body, statusEl, rows, all.length, stockEntries.length, rangeDays);
+        lastView = { rows, rangeDays, stockMap };
+        renderTable(body, statusEl, rows, rangeDays);
       } catch (e) {
         body.innerHTML = `<div class="tdtl-empty">Error: ${(e && e.message) || e}</div>`;
         statusEl.textContent = 'Error.';
       } finally {
         setLoading(false);
+        fetching = false;
+        pullBtn.disabled = false;
       }
     }
 
     function softRefresh(){
-      if (!lastFetched) return doPull();
-      const { allLogs, stockEntriesCount, rangeDays } = lastFetched;
-      const key = (keyInput.value || '').trim();
+      if (!lastView) return doPull();
+      const { rangeDays, stockMap } = lastView;
+      const to = unixNow();
+      const fromRange = daysAgoUnix(rangeDays);
       const manualMap = getManualMap();
-      (async () => {
-        setLoading(true);
-        try {
-          const stockMap = await loadStockMap(key);
-          const rows = buildLedgerAndRows(allLogs, stockMap, manualMap);
-          lastFetched.rows = rows;
-          renderTable(body, statusEl, rows, allLogs.length, stockEntriesCount, rangeDays);
-        } catch(e){
-          notify('Soft refresh failed: ' + (e && e.message || e));
-        } finally {
-          setLoading(false);
-        }
-      })();
+      try {
+        const rows = buildRowsForRange(fromRange, to, stockMap, manualMap);
+        lastView.rows = rows;
+        renderTable(body, statusEl, rows, rangeDays);
+      } catch(e){
+        notify('Soft refresh failed: ' + (e && e.message || e));
+      }
     }
 
     document.addEventListener('tdtl-refresh-now', softRefresh);
@@ -664,6 +846,5 @@
     }
   });
 
-  // Show only on the Stocks page, plus add a launcher there
   if (onStocksPage()) { createPanel(); addLauncher(); }
 })();
