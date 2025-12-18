@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Day Trader Logbook (Experimental)
 // @namespace    https://torn.com/
-// @version      1.1.2-exp
+// @version      1.1.3-exp
 // @description  Draggable panel for Torn stocks showing BUY/SELL logs (5510/5511) for 7/14/30 days plus custom date range. Sticky position, loading bar, average-cost ledger, tickers. Columns: Buy Price, Sell Price, Shares, Gross (Sell), Fee (0.10%), Total Buy, Total Sell, Profit. BUY rows show “N/A” in Total Sell and “—” in Gross (Sell). Click rows to highlight (Ctrl/Cmd). Inline manual BUY price for old SELLs. Requires Full Access API key. Made by Eaglewing [571041].
 // @match        https://www.torn.com/page.php?sid=stocks*
 // @run-at       document-idle
@@ -725,6 +725,8 @@
       const fromStr = (fromEl && fromEl.value) ? fromEl.value : '';
       const toStr   = (toEl && toEl.value) ? toEl.value : '';
 
+      const isPresetRange = !(fromStr && toStr); // presets (7D/14D/30D) always fetch live
+
       let from, to, label;
       if (fromStr && toStr) {
         from = dateStrToUnixStart(fromStr);
@@ -747,8 +749,27 @@
       try {
         const stockMap = await loadStockMap(key);
 
-        // Cache-aware pull: fetch ONLY missing parts of the requested time window
-        await ensureRangeCached(key, from, to, statusEl);
+        // Fetch strategy:
+        // - Preset ranges (7D/14D/30D): ALWAYS fetch live data from the API (then merge into cache)
+        // - Custom date range: cache-aware (fetch ONLY missing parts)
+        if (isPresetRange) {
+          statusEl.textContent = `Fetching live logs for ${label}…`;
+          const { all } = await fetchLogsWindow(key, from, to, (p) => {
+            if (!p) return;
+            statusEl.textContent = `Fetching live logs… (pages: ${p.pages + 1}, logs: ${p.count.toLocaleString()})`;
+          });
+
+          // Merge into cache (dedupe by log id)
+          const cache = getLogCache();
+          for (const entry of all) {
+            if (entry && entry.id && !cache[entry.id]) cache[entry.id] = entry;
+          }
+          setLogCache(cache);
+          addCoverage(from, to);
+        } else {
+          // Cache-aware pull: fetch ONLY missing parts of the requested time window
+          await ensureRangeCached(key, from, to, statusEl);
+        }
 
         // Display window logs (what the user asked for)
         const displayLogs = getCachedLogsInRange(from, to);
