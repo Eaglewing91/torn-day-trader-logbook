@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Day Trader Logbook (Experimental)
 // @namespace    https://torn.com/
-// @version      1.1.3-exp
+// @version      1.1.4-exp
 // @description  Draggable panel for Torn stocks showing BUY/SELL logs (5510/5511) for 7/14/30 days plus custom date range. Sticky position, loading bar, average-cost ledger, tickers. Columns: Buy Price, Sell Price, Shares, Gross (Sell), Fee (0.10%), Total Buy, Total Sell, Profit. BUY rows show “N/A” in Total Sell and “—” in Gross (Sell). Click rows to highlight (Ctrl/Cmd). Inline manual BUY price for old SELLs. Requires Full Access API key. Made by Eaglewing [571041].
 // @match        https://www.torn.com/page.php?sid=stocks*
 // @run-at       document-idle
@@ -361,15 +361,28 @@
   // ------------------ Extractors --------------
   function extractFields(entry) {
     const d = entry?.data || {};
-    const stockId = (typeof d.stock === 'number') ? d.stock : null;
 
-    let shares = null, gross = null, price = null;
-    if (typeof d.amount === 'number') shares = d.amount;
-    if (typeof d.worth  === 'number') gross  = d.worth; // SELL (5511): Torn's NET
-    if (d.price != null) {
-      const p = (typeof d.price === 'number') ? d.price : parseFloat(d.price);
-      if (!Number.isNaN(p) && Number.isFinite(p)) price = p;
-    }
+    // Robust number parsing (handles "1,234.56", "$1,234.56", etc.)
+    const toNum = (v) => {
+      if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+      if (typeof v === 'string') {
+        const cleaned = v.replace(/[^0-9.]/g, '');
+        if (!cleaned) return null;
+        const n = parseFloat(cleaned);
+        return Number.isFinite(n) ? n : null;
+      }
+      return null;
+    };
+
+    const stockId =
+      (typeof d.stock === 'number') ? d.stock :
+      (typeof d.stock === 'string' && /^\d+$/.test(d.stock)) ? Number(d.stock) :
+      null;
+
+    let shares = toNum(d.amount);
+    let gross  = toNum(d.worth); // SELL (5511): Torn's NET
+    let price  = toNum(d.price);
+
     if (price == null && shares != null && gross != null && shares > 0) price = gross / shares;
     if (gross == null && shares != null && price != null) gross = shares * price;
 
