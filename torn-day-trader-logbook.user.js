@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Day Trader Logbook (Experimental)
 // @namespace    https://torn.com/
-// @version      1.1.4-exp
-// @description  Draggable panel for Torn stocks showing BUY/SELL logs (5510/5511) for 7/14/30 days plus custom date range. Sticky position, loading bar, average-cost ledger, tickers. Columns: Buy Price, Sell Price, Shares, Gross (Sell), Fee (0.10%), Total Buy, Total Sell, Profit. BUY rows show “N/A” in Total Sell and “—” in Gross (Sell). Click rows to highlight (Ctrl/Cmd). Inline manual BUY price for old SELLs. Requires Full Access API key. Made by Eaglewing [571041].
+// @version      1.1.5-exp
+// @description  Draggable panel for Torn stocks showing BUY/SELL logs (5510/5511) for 7/14/30 days plus custom date range. Sticky position, loading bar, average-cost ledger, tickers. Columns: Buy Price, Sell Price, Shares, Gross (Sell), Fee (0.10%), Total Buy, Total Sell, Profit. BUY rows show “N/A” in Total Sell and “—” in Gross (Sell). Click rows to highlight (Ctrl/Cmd). Inline manual BUY price for old SELLs. Requires Full Access API key. Made by Eaglewing [571041]. Now includes per-stock tabs.
 // @match        https://www.torn.com/page.php?sid=stocks*
 // @run-at       document-idle
 // @grant        GM_getValue
@@ -11,6 +11,9 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_notification
 // @license      MIT
+// @homepageURL   https://github.com/Eaglewing91/torn-day-trader-logbook
+// @updateURL     https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
+// @downloadURL   https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // ==/UserScript==
 
 (function () {
@@ -28,10 +31,11 @@
   const KEY_POS         = 'tdtl_panel_pos_v111exp';    // { left, top }
   const KEY_MANUAL      = 'tdtl_manual_buys_v111exp';  // { [sellLogId]: { buyPrice:number, ts:number } }
 
+  const KEY_ACTIVE_TICKER = 'tdtl_active_ticker_v111exp'; // 'ALL' or ticker acronym (e.g., ELT)
+
   // Persistent log cache (deduped by log id) + coverage tracking (merged intervals)
   const KEY_LOG_CACHE   = 'tdtl_log_cache_v111exp';    // { [logId]: logObjWithId }
   const KEY_COVERAGE    = 'tdtl_log_cov_v111exp';      // Array<[fromTs,toTs]> inclusive
-
 
   const MAX_PAGES = 350;
   const MAX_LOGS  = 50000;
@@ -71,6 +75,25 @@
     ? '$' + n.toLocaleString(undefined,{maximumFractionDigits:0})
     : '—';
   const intFmt = (n)=> (typeof n==='number' && isFinite(n)) ? n.toLocaleString(undefined) : '—';
+
+  // ------------------ Tabs (per-stock) -------------------
+  function getActiveTicker(){
+    const v = GM_getValue(KEY_ACTIVE_TICKER, 'ALL');
+    return (typeof v === 'string' && v) ? v : 'ALL';
+  }
+  function setActiveTicker(v){
+    GM_setValue(KEY_ACTIVE_TICKER, v || 'ALL');
+  }
+  function uniqueTickers(rows){
+    const set = new Set();
+    for (const r of rows) if (r?.ticker) set.add(r.ticker);
+    return Array.from(set).sort((a,b)=> String(a).localeCompare(String(b)));
+  }
+  function filterRowsByTicker(rows){
+    const t = getActiveTicker();
+    if (!t || t === 'ALL') return rows;
+    return rows.filter(r => r.ticker === t);
+  }
 
   // Manual cache helpers
   function getManualMap(){
@@ -191,7 +214,6 @@
     GM_setValue(KEY_COVERAGE, []);
   }
 
-
   // ------------------ Styles -------------------
   GM_addStyle(`
     .tdtl-wrap{position:fixed;z-index:999999;right:20px;bottom:20px;width:1180px;max-height:82vh;
@@ -232,6 +254,13 @@
     .tdtl-credit{opacity:.85}
     .tdtl-close{margin-left:10px}
     .tdtl-launcher{position:fixed;top:84px;right:20px;z-index:999998}
+
+    /* Tabs */
+    .tdtl-tabs{display:flex;gap:8px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #2b2f36;background:#0e141d}
+    .tdtl-tab{background:#141b26;color:#fff;border:1px solid #2b2f36;padding:6px 10px;border-radius:999px;font-size:12px;cursor:pointer}
+    .tdtl-tab:hover{background:#1b2637}
+    .tdtl-tab.active{background:#4d7cff;border-color:#93b4ff;box-shadow:0 0 0 2px rgba(147,180,255,.20) inset}
+
     /* Buy cell layout */
     .tdtl-buycell{white-space:nowrap;}
     .tdtl-buywrap{display:inline-flex;align-items:center;gap:6px;}
@@ -505,7 +534,7 @@
     });
   }
 
-  function renderTable(body, statusEl, rows, rawCount, stockCount, rangeDays, windowLabel) {
+  function renderTable(body, statusEl, rows, rawCount, stockCount, rangeDays, windowLabel, rowsWindowForTabs) {
     if (!rows.length) {
       body.innerHTML = `<div class="tdtl-empty">No BUY/SELL logs for ${windowLabel ? windowLabel : ('last ' + rangeDays + ' day(s)')}. (Pulled ${rawCount} → ${stockCount} stock logs)</div>`;
       statusEl.textContent = `Done.`;
@@ -514,7 +543,31 @@
 
     const summaryEl = document.createElement('div');
     summaryEl.className = 'tdtl-summary';
+
+    // Tabs (ALL + one per ticker in the current window)
+    const tabs = document.createElement('div');
+    tabs.className = 'tdtl-tabs';
+    const active = getActiveTicker();
+
+    const windowRows = Array.isArray(rowsWindowForTabs) ? rowsWindowForTabs : rows;
+    const tickers = uniqueTickers(windowRows);
+
+    const addTab = (label, value) => {
+      const btn = document.createElement('button');
+      btn.className = 'tdtl-tab' + ((active === value) ? ' active' : '');
+      btn.textContent = label;
+      btn.addEventListener('click', () => {
+        setActiveTicker(value);
+        document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
+      });
+      tabs.appendChild(btn);
+    };
+
+    addTab('ALL', 'ALL');
+    for (const t of tickers) addTab(t, t);
+
     body.innerHTML = '';
+    body.appendChild(tabs);
     body.appendChild(summaryEl);
     renderSummary(summaryEl, rows);
 
@@ -767,10 +820,7 @@
         // - Custom date range: cache-aware (fetch ONLY missing parts)
         if (isPresetRange) {
           statusEl.textContent = `Fetching live logs for ${label}…`;
-          const { all } = await fetchLogsWindow(key, from, to, (p) => {
-            if (!p) return;
-            statusEl.textContent = `Fetching live logs… (pages: ${p.pages + 1}, logs: ${p.count.toLocaleString()})`;
-          });
+          const { all } = await fetchLogsWindow(key, from, to);
 
           // Merge into cache (dedupe by log id)
           const cache = getLogCache();
@@ -797,12 +847,19 @@
         const stockEntries = displayLogs.filter(x => s(x.category || x.cat || '').toLowerCase().includes('stock'));
         const manualMap = getManualMap();
 
-        // Build ledger from context + display, then only show rows within the display window
+        // Build ledger from context + display
         const rowsAll = buildLedgerAndRows(ledgerInput, stockMap, manualMap);
-        const rows = rowsAll.filter(r => typeof r.ts === 'number' && r.ts >= from && r.ts <= to);
+        const rowsWindow = rowsAll.filter(r => typeof r.ts === 'number' && r.ts >= from && r.ts <= to);
 
-        lastFetched = { rows, allLogs: displayLogs, stockEntriesCount: stockEntries.length, rangeDays, fromTs: from, toTs: to, windowLabel: label };
-        renderTable(body, statusEl, rows, displayLogs.length, stockEntries.length, rangeDays, label);
+        // If selected tab isn't in this window, reset to ALL
+        const active = getActiveTicker();
+        if (active !== 'ALL' && !rowsWindow.some(r => r.ticker === active)) setActiveTicker('ALL');
+
+        // Display filter only (ledger math stays correct)
+        const rows = filterRowsByTicker(rowsWindow);
+
+        lastFetched = { rowsWindow, rows, allLogs: displayLogs, stockEntriesCount: stockEntries.length, rangeDays, fromTs: from, toTs: to, windowLabel: label };
+        renderTable(body, statusEl, rows, displayLogs.length, stockEntries.length, rangeDays, label, rowsWindow);
       } catch (e) {
         body.innerHTML = `<div class="tdtl-empty">Error: ${(e && e.message) || e}</div>`;
         statusEl.textContent = 'Error.';
@@ -831,12 +888,19 @@
           const stockEntriesCount = displayLogs.filter(x => s(x.category || x.cat || '').toLowerCase().includes('stock')).length;
 
           const rowsAll = buildLedgerAndRows(ledgerInput, stockMap, manualMap);
-          const rows = rowsAll.filter(r => typeof r.ts === 'number' && r.ts >= from && r.ts <= to);
+          const rowsWindow = rowsAll.filter(r => typeof r.ts === 'number' && r.ts >= from && r.ts <= to);
 
+          const active = getActiveTicker();
+          if (active !== 'ALL' && !rowsWindow.some(r => r.ticker === active)) setActiveTicker('ALL');
+
+          const rows = filterRowsByTicker(rowsWindow);
+
+          lastFetched.rowsWindow = rowsWindow;
           lastFetched.rows = rows;
           lastFetched.allLogs = displayLogs;
           lastFetched.stockEntriesCount = stockEntriesCount;
-          renderTable(body, statusEl, rows, displayLogs.length, stockEntriesCount, rangeDays, lastFetched.windowLabel);
+
+          renderTable(body, statusEl, rows, displayLogs.length, stockEntriesCount, rangeDays, lastFetched.windowLabel, rowsWindow);
         } catch(e){
           notify('Soft refresh failed: ' + (e && e.message || e));
         } finally {
@@ -916,7 +980,6 @@
     notify('Cached log history cleared.');
     document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
   });
-
 
   if (onStocksPage()) { createPanel(); addLauncher(); }
 })();
