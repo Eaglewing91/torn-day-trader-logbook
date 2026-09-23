@@ -1,985 +1,925 @@
 // ==UserScript==
-// @name         Torn Day Trader Logbook (Experimental)
-// @namespace    https://torn.com/
-// @version      1.1.5-exp
-// @description  Draggable panel for Torn stocks showing BUY/SELL logs (5510/5511) for 7/14/30 days plus custom date range. Sticky position, loading bar, average-cost ledger, tickers. Columns: Buy Price, Sell Price, Shares, Gross (Sell), Fee (0.10%), Total Buy, Total Sell, Profit. BUY rows show “N/A” in Total Sell and “—” in Gross (Sell). Click rows to highlight (Ctrl/Cmd). Inline manual BUY price for old SELLs. Requires Full Access API key. Made by Eaglewing [571041]. Now includes per-stock tabs.
-// @match        https://www.torn.com/page.php?sid=stocks*
+// @name         Torn Stock Ledger
+// @namespace    https://github.com/Eaglewing91
+// @version      1.0.0
+// @author       Eaglewing [571041]
+// @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
+// @updateURL   https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-stock-ledger.user.js
+// @downloadURL https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-stock-ledger.user.js
+// @description  Newly developed, fully working release of the original Torn Day Trader Logbook (Experimental), now named Torn Stock Ledger. View stock trades, costs, fees and profit for 7/14/30 days, custom dates, or full account history. Full History may take a minute or two to obtain all available data. Requires a Full Access API key.
+// @match        https://www.torn.com/page.php*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
-// @grant        GM_registerMenuCommand
-// @grant        GM_notification
 // @license      MIT
-// @homepageURL   https://github.com/Eaglewing91/torn-day-trader-logbook
-// @updateURL     https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
-// @downloadURL   https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // ==/UserScript==
 
+// Standalone page implementation. On Stocks, the header contains a link; on
+// the ledger URL, the stock application is replaced with the ledger page.
+// Balanced-row build: compact trade text increased by about 15%.
 (function () {
   'use strict';
 
-  // ------------------ Config ------------------
-  const API_BASE = 'https://api.torn.com';
-  const TITLE = 'Torn Day Trader Logbook';
+  const STOCKS_URL = '/page.php?sid=stocks';
+  const LEDGER_URL = STOCKS_URL + '&ewStockLedger=1';
+  const API = 'https://api.torn.com';
+  const DAY = 86400;
+  const PAGE_LIMIT = 100;
+  const WINDOW = 90 * DAY;
+  const STOCK_BUY = 5510;
+  const STOCK_SELL = 5511;
 
-  const KEY_API         = 'tdtl_api_key_v111exp';
-  const KEY_LAST_RANGE  = 'tdtl_last_range_v111exp';   // '7' | '14' | '30'
-  const KEY_CUSTOM_FROM = 'tdtl_custom_from_v111exp';  // 'YYYY-MM-DD' or ''
-  const KEY_CUSTOM_TO   = 'tdtl_custom_to_v111exp';    // 'YYYY-MM-DD' or ''
-  const KEY_STOCK_MAP   = 'tdtl_stock_map_v111exp';    // cache: stock id -> acronym/name
-  const KEY_POS         = 'tdtl_panel_pos_v111exp';    // { left, top }
-  const KEY_MANUAL      = 'tdtl_manual_buys_v111exp';  // { [sellLogId]: { buyPrice:number, ts:number } }
+  // Retaining these keys keeps the full history already imported by the
+  // separate ledger test available to this release.
+  const KEY = Object.freeze({
+    api: 'tdtl_history_test_api_key_v111exp',
+    range: 'tdtl_history_test_last_range_v111exp',
+    from: 'tdtl_history_test_custom_from_v111exp',
+    to: 'tdtl_history_test_custom_to_v111exp',
+    stockMap: 'tdtl_history_test_stock_map_v111exp',
+    manual: 'tdtl_history_test_manual_buys_v111exp',
+    ticker: 'tdtl_history_test_active_ticker_v111exp',
+    logs: 'tdtl_history_test_log_cache_v111exp',
+    coverage: 'tdtl_history_test_stock_cov_v1110test',
+    signup: 'torn_stock_ledger_signup_v1'
+  });
 
-  const KEY_ACTIVE_TICKER = 'tdtl_active_ticker_v111exp'; // 'ALL' or ticker acronym (e.g., ELT)
-
-  // Persistent log cache (deduped by log id) + coverage tracking (merged intervals)
-  const KEY_LOG_CACHE   = 'tdtl_log_cache_v111exp';    // { [logId]: logObjWithId }
-  const KEY_COVERAGE    = 'tdtl_log_cov_v111exp';      // Array<[fromTs,toTs]> inclusive
-
-  const MAX_PAGES = 350;
-  const MAX_LOGS  = 50000;
-
-  const TYPE_BUY   = 5510;
-  const TYPE_SELL  = 5511;
-
-  // ------------------ Utils -------------------
-  const s = (x) => (x == null ? '' : String(x));
-  const unixNow = () => Math.floor(Date.now()/1000);
-  const daysAgoUnix = (days) => unixNow() - days * 86400;
-  const asDate = (ts) =>
-    new Date(ts*1000).toLocaleString(undefined,{
-      year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'
+  const now = () => Math.floor(Date.now() / 1000);
+  const readObject = (key) => {
+    const value = GM_getValue(key, {});
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  };
+  const number = (value) => {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value !== 'string') return null;
+    const clean = value.replace(/[^\d.-]/g, '');
+    if (!clean || clean === '-' || clean === '.') return null;
+    const parsed = Number(clean);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const currency = (value, decimals = 0) => value == null ? '—' :
+    '$' + Number(value).toLocaleString(undefined, {
+      minimumFractionDigits: decimals, maximumFractionDigits: decimals
     });
+  const quantity = (value) => Number(value).toLocaleString();
+  const when = (timestamp) => new Date(timestamp * 1000).toLocaleString();
+  const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-  // Date input helpers (local time)
-  function dateStrToUnixStart(dStr){
-    // YYYY-MM-DD -> local start of day
-    const d = new Date(dStr + 'T00:00:00');
-    return Math.floor(d.getTime()/1000);
-  }
-  function dateStrToUnixEnd(dStr){
-    // YYYY-MM-DD -> local end of day
-    const d = new Date(dStr + 'T23:59:59');
-    return Math.floor(d.getTime()/1000);
-  }
-
-  function notify(text){
-    try { GM_notification({ title: TITLE, text, timeout: 3000 }); } catch { console.log(text); }
+  function dateBoundary(text, end = false) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return NaN;
+    const date = new Date(text + (end ? 'T23:59:59' : 'T00:00:00'));
+    if (date.getFullYear() !== Number(text.slice(0, 4)) ||
+        date.getMonth() + 1 !== Number(text.slice(5, 7)) ||
+        date.getDate() !== Number(text.slice(8, 10))) return NaN;
+    return Math.floor(date.getTime() / 1000);
   }
 
-  const price2 = (n)=> (typeof n==='number' && isFinite(n))
-    ? n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})
-    : '—';
-  const money0 = (n)=> (typeof n==='number' && isFinite(n))
-    ? '$' + n.toLocaleString(undefined,{maximumFractionDigits:0})
-    : '—';
-  const intFmt = (n)=> (typeof n==='number' && isFinite(n)) ? n.toLocaleString(undefined) : '—';
-
-  // ------------------ Tabs (per-stock) -------------------
-  function getActiveTicker(){
-    const v = GM_getValue(KEY_ACTIVE_TICKER, 'ALL');
-    return (typeof v === 'string' && v) ? v : 'ALL';
-  }
-  function setActiveTicker(v){
-    GM_setValue(KEY_ACTIVE_TICKER, v || 'ALL');
-  }
-  function uniqueTickers(rows){
-    const set = new Set();
-    for (const r of rows) if (r?.ticker) set.add(r.ticker);
-    return Array.from(set).sort((a,b)=> String(a).localeCompare(String(b)));
-  }
-  function filterRowsByTicker(rows){
-    const t = getActiveTicker();
-    if (!t || t === 'ALL') return rows;
-    return rows.filter(r => r.ticker === t);
-  }
-
-  // Manual cache helpers
-  function getManualMap(){
-    const obj = GM_getValue(KEY_MANUAL, {});
-    if (obj && typeof obj === 'object') return obj;
-    return {};
-  }
-  function setManualBuy(sellLogId, buyPrice){
-    const map = getManualMap();
-    if (buyPrice == null || !isFinite(buyPrice) || buyPrice <= 0) {
-      delete map[sellLogId];
-    } else {
-      map[sellLogId] = { buyPrice: Number(buyPrice), ts: unixNow() };
-    }
-    GM_setValue(KEY_MANUAL, map);
-  }
-  function clearAllManual(){
-    GM_setValue(KEY_MANUAL, {});
-  }
-
-  // ------------------ Log cache + coverage ------------------
-  function getLogCache(){
-    const obj = GM_getValue(KEY_LOG_CACHE, {});
-    return (obj && typeof obj === 'object') ? obj : {};
-  }
-  function setLogCache(obj){
-    GM_setValue(KEY_LOG_CACHE, obj);
-  }
-  function getCoverage(){
-    const cov = GM_getValue(KEY_COVERAGE, []);
-    return Array.isArray(cov) ? cov : [];
-  }
-  function setCoverage(cov){
-    GM_setValue(KEY_COVERAGE, cov);
-  }
-  function normalizeCoverage(cov){
-    // cov: Array<[from,to]> inclusive
-    const items = (Array.isArray(cov) ? cov : [])
-      .map(x => [Number(x?.[0]), Number(x?.[1])])
-      .filter(([a,b]) => isFinite(a) && isFinite(b))
-      .map(([a,b]) => a<=b ? [a,b] : [b,a])
-      .sort((x,y)=> x[0]-y[0] || x[1]-y[1]);
-
+  function normalizeCoverage(intervals) {
+    const sorted = (Array.isArray(intervals) ? intervals : [])
+      .map(pair => [Number(pair?.[0]), Number(pair?.[1])])
+      .filter(([start, end]) => Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= end)
+      .sort((a, b) => a[0] - b[0]);
     const merged = [];
-    for (const [a,b] of items){
-      if (!merged.length) { merged.push([a,b]); continue; }
-      const last = merged[merged.length-1];
-      if (a <= last[1] + 1) last[1] = Math.max(last[1], b);
-      else merged.push([a,b]);
+    for (const interval of sorted) {
+      const previous = merged[merged.length - 1];
+      if (previous && interval[0] <= previous[1] + 1) {
+        previous[1] = Math.max(previous[1], interval[1]);
+      } else {
+        merged.push([...interval]);
+      }
     }
     return merged;
   }
-  function addCoverage(from, to){
-    const cov = normalizeCoverage([...getCoverage(), [from,to]]);
-    setCoverage(cov);
-    return cov;
+
+  function coverage() {
+    return normalizeCoverage(GM_getValue(KEY.coverage, []));
   }
-  function subtractIntervals(reqFrom, reqTo, cov){
-    // returns missing intervals within [reqFrom, reqTo] not covered by cov
+
+  function markCovered(start, end) {
+    GM_setValue(KEY.coverage, normalizeCoverage([...coverage(), [start, end]]));
+  }
+
+  function missingIntervals(start, end) {
+    let cursor = start;
     const missing = [];
-    let cursor = reqFrom;
-    const norm = normalizeCoverage(cov);
-    for (const [a,b] of norm){
+    for (const [a, b] of coverage()) {
       if (b < cursor) continue;
-      if (a > reqTo) break;
-      if (a > cursor) missing.push([cursor, Math.min(reqTo, a-1)]);
-      cursor = Math.max(cursor, b+1);
-      if (cursor > reqTo) break;
+      if (a > end) break;
+      if (a > cursor) missing.push([cursor, Math.min(a - 1, end)]);
+      cursor = Math.max(cursor, b + 1);
+      if (cursor > end) break;
     }
-    if (cursor <= reqTo) missing.push([cursor, reqTo]);
-    return missing.filter(([a,b]) => a<=b);
+    if (cursor <= end) missing.push([cursor, end]);
+    return missing;
   }
 
-  async function ensureRangeCached(key, from, to, statusEl){
-    // Cache-aware fetch: only pull missing sub-ranges for [from,to]
-    const cov = getCoverage();
-    const missing = subtractIntervals(from, to, cov);
-    if (!missing.length) return;
+  function coveredSeconds(start, end) {
+    return coverage().reduce((sum, [a, b]) =>
+      sum + Math.max(0, Math.min(end, b) - Math.max(start, a) + 1), 0);
+  }
 
-    let cache = getLogCache();
-
-    for (let i=0; i<missing.length; i++){
-      const [mFrom, mTo] = missing[i];
-      if (statusEl) statusEl.textContent = `Fetching missing logs ${i+1}/${missing.length}… (${asDate(mFrom)} → ${asDate(mTo)})`;
-
-      const { all, lastStatus } = await fetchLogsWindow(key, mFrom, mTo);
-      // Merge into cache
-      for (const entry of all){
-        if (entry && entry.id && !cache[entry.id]) cache[entry.id] = entry;
+  function windowsFor(intervals) {
+    const windows = [];
+    for (const [start, end] of [...intervals].reverse()) {
+      for (let last = end; last >= start;) {
+        const first = Math.max(start, last - WINDOW + 1);
+        windows.push([first, last]);
+        last = first - 1;
       }
-      setLogCache(cache);
-      addCoverage(mFrom, mTo);
-
-      if (statusEl) statusEl.textContent = `Fetched ${all.length} logs (${lastStatus}). Cached coverage updated.`;
     }
+    return windows;
   }
 
-  function getCachedLogsInRange(from, to){
-    const cache = getLogCache();
-    return Object.values(cache).filter(l => {
-      const ts = l?.timestamp;
-      return typeof ts === 'number' && ts >= from && ts <= to;
-    });
-  }
-
-  // Ledger context helper: include prior BUY/SELL events so SELLs inside the
-  // selected range can resolve a buy price / average cost basis correctly.
-  function getCachedLogsBefore(ts){
-    const cache = getLogCache();
-    return Object.values(cache).filter(l => {
-      const t = l?.timestamp;
-      return typeof t === 'number' && t < ts;
-    });
-  }
-
-  function clearLogCacheWithCoverage(){
-    GM_setValue(KEY_LOG_CACHE, {});
-    GM_setValue(KEY_COVERAGE, []);
-  }
-
-  // ------------------ Styles -------------------
-  GM_addStyle(`
-    .tdtl-wrap{position:fixed;z-index:999999;right:20px;bottom:20px;width:1180px;max-height:82vh;
-      background:#0b0e13;color:#f5f7fa;border:1px solid #2b2f36;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.6);
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-    .tdtl-header{cursor:move;padding:10px 12px;font-weight:700;font-size:14px;display:flex;align-items:center;justify-content:space-between;
-      background:#10151d;border-bottom:1px solid #2b2f36;border-radius:10px 10px 0 0;color:#ffffff}
-    .tdtl-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #2b2f36;background:#0e141d}
-    .tdtl-btn{background:#1f2a3a;color:#ffffff;border:1px solid #4a5a76;padding:6px 10px;border-radius:8px;font-size:12px;cursor:pointer;transition:.1s ease}
-    .tdtl-btn:hover{background:#2a3a54}
-    .tdtl-btn.active{background:#4d7cff;border-color:#93b4ff;box-shadow:0 0 0 2px rgba(147,180,255,.25) inset, 0 0 12px rgba(77,124,255,.25)}
-    .tdtl-input{background:#0b0e13;color:#ffffff;border:1px solid #2b2f36;border-radius:6px;padding:6px 8px;font-size:13px;width:300px}
-    .tdtl-date{background:#0b0e13;color:#ffffff;border:1px solid #2b2f36;border-radius:6px;padding:6px 8px;font-size:12px;width:140px}
-    .tdtl-diagnostics{padding:8px 12px;border-bottom:1px solid #2b2f36;background:#0e141d}
-    .tdtl-progress{position:relative;width:100%;height:8px;background:#1a2230;border-radius:6px;overflow:hidden;display:none}
-    .tdtl-progress.active{display:block}
-    .tdtl-progress-bar{position:absolute;top:0;left:-40%;width:40%;height:100%;
-      background:linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd)}
-    @keyframes tdtl-indeterminate{0%{left:-40%}100%{left:100%}}
-    .tdtl-progress.active .tdtl-progress-bar{animation:tdtl-indeterminate 1.15s linear infinite}
-    .tdtl-body{overflow:auto;max-height:calc(82vh - 206px)}
-    .tdtl-summary{padding:8px 12px;background:#0e141d;border-bottom:1px solid #2b2f36;display:flex;gap:16px;flex-wrap:wrap}
-    .tdtl-summary .card{background:#10151d;border:1px solid #2b2f36;border-radius:8px;padding:8px 10px;min-width:160px}
-    .tdtl-table{width:100%;border-collapse:collapse;font-size:13.5px;color:#ffffff}
-    .tdtl-table th,.tdtl-table td{padding:8px;border-bottom:1px solid #232a34;text-align:left;vertical-align:middle;background:#0b0e13}
-    .tdtl-table th{position:sticky;top:0;background:#10151d;z-index:1;color:#ffffff}
-    .tdtl-wrap, .tdtl-wrap * { color: #f5f7fa !important; }
-    .tdtl-pill{display:inline-block;padding:2px 6px;border-radius:6px;font-weight:700}
-    .tdtl-buy{background:#0d3a23;color:#9cf9be;border:1px solid #2a6a47}
-    .tdtl-sell{background:#3a1d1d;color:#ffb4b4;border:1px solid #6a2a2a}
-    .tdtl-profit-pos{color:#9cf9be !important;font-weight:700}
-    .tdtl-profit-neg{color:#ffb4b4 !important;font-weight:700}
-    .tdtl-table tbody tr:hover td{background:#141e2d !important}
-    .tdtl-row-selected td{background:#243553 !important;box-shadow: inset 0 0 0 9999px rgba(36,53,83,0.18);outline:1px solid #4d7cff;}
-    .tdtl-muted{color:#c7d3e0 !important;}
-    .tdtl-empty{padding:16px 12px;color:#c7d3e0}
-    .tdtl-footer{padding:8px 12px;font-size:11px;color:#c7d3e0;display:flex;gap:8px;justify-content:space-between;align-items:center;flex-wrap:wrap}
-    .tdtl-credit{opacity:.85}
-    .tdtl-close{margin-left:10px}
-    .tdtl-launcher{position:fixed;top:84px;right:20px;z-index:999998}
-
-    /* Tabs */
-    .tdtl-tabs{display:flex;gap:8px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid #2b2f36;background:#0e141d}
-    .tdtl-tab{background:#141b26;color:#fff;border:1px solid #2b2f36;padding:6px 10px;border-radius:999px;font-size:12px;cursor:pointer}
-    .tdtl-tab:hover{background:#1b2637}
-    .tdtl-tab.active{background:#4d7cff;border-color:#93b4ff;box-shadow:0 0 0 2px rgba(147,180,255,.20) inset}
-
-    /* Buy cell layout */
-    .tdtl-buycell{white-space:nowrap;}
-    .tdtl-buywrap{display:inline-flex;align-items:center;gap:6px;}
-    .tdtl-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border:1px solid #4a5a76;border-radius:6px;background:#1f2a3a;cursor:pointer;font-size:11px;line-height:1}
-    .tdtl-icon-btn:hover{background:#2a3a54}
-    .tdtl-tag{display:inline-block;font-size:10px;padding:2px 6px;border:1px solid #4a5a76;border-radius:999px;opacity:0.9}
-    .tdtl-inline-editor{display:inline-flex;align-items:center;gap:6px;}
-    .tdtl-inline-editor input{width:90px;background:#0b0e13;color:#fff;border:1px solid #2b2f36;border-radius:6px;padding:4px 6px;font-size:12px;}
-  `);
-
-  // ------------------ Drag (with position save) --------------------
-  function makeDraggable(handle, container, onStop) {
-    let start = null, base = null, dragging = false;
-    handle.addEventListener('mousedown', e => {
-      dragging = true;
-      start = { x: e.clientX, y: e.clientY };
-      const r = container.getBoundingClientRect();
-      base = { x: r.left, y: r.top };
-      document.body.style.userSelect = 'none';
-      e.preventDefault();
-    });
-    window.addEventListener('mousemove', e => {
-      if (!dragging) return;
-      const dx = e.clientX - start.x, dy = e.clientY - start.y;
-      container.style.left = `${base.x + dx}px`;
-      container.style.top  = `${base.y + dy}px`;
-      container.style.right = 'auto';
-      container.style.bottom = 'auto';
-      container.style.position = 'fixed';
-    });
-    window.addEventListener('mouseup', () => {
-      if (!dragging) return;
-      dragging = false;
-      document.body.style.userSelect = '';
-      if (typeof onStop === 'function') onStop();
-    });
-  }
-
-  // Persist/Restore helpers
-  function clamp(n, min, max){ return Math.max(min, Math.min(max, n)); }
-  function savePanelPos(el){
-    const r = el.getBoundingClientRect();
-    GM_setValue(KEY_POS, { left: Math.round(r.left), top: Math.round(r.top) });
-  }
-  function restorePanelPos(el){
-    const pos = GM_getValue(KEY_POS, null);
-    if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') return;
-    const vw = window.innerWidth, vh = window.innerHeight;
-    const w = el.offsetWidth || 1180, h = el.offsetHeight || 400;
-    const left = clamp(pos.left, 0, Math.max(0, vw - w));
-    const top  = clamp(pos.top,  0, Math.max(0, vh - h));
-    el.style.left = `${left}px`;
-    el.style.top  = `${top}px`;
-    el.style.right = 'auto';
-    el.style.bottom = 'auto';
-    el.style.position = 'fixed';
-  }
-
-  // ------------------ HTTP --------------------
-  async function fetchJSON(url, attempt = 0) {
-    const r = await fetch(url, { cache: 'no-store' });
-
-    // Network-level throttling
-    if (r.status === 429 || r.status === 503) {
-      const backoff = Math.min(2000 * (attempt + 1), 8000);
-      await new Promise(res => setTimeout(res, backoff));
-      return fetchJSON(url, attempt + 1);
-    }
-
-    let data = null; try { data = await r.json(); } catch {}
-
-    // Torn API limit (code 5) can come back as a JSON error payload.
-    if (data?.error?.code === 5) {
-      const waitMs = 65000;
-      await new Promise(res => setTimeout(res, waitMs));
-      return fetchJSON(url, attempt + 1);
-    }
-
-    return { status: r.status, data };
-  }
-  const buildURL = (section, params) => `${API_BASE}/${section}/?${new URLSearchParams(params).toString()}`;
-
-  // ------------------ Stock map (tickers) -----
-  async function loadStockMap(key) {
-    let map = GM_getValue(KEY_STOCK_MAP, null);
-    if (map && typeof map === 'object') return map;
-    const url = `${API_BASE}/torn/?selections=stocks&key=${key}`;
-    const { data } = await fetchJSON(url);
-    if (data?.stocks) {
-      map = {};
-      for (const [id, st] of Object.entries(data.stocks)) {
-        map[id] = { acronym: st.acronym || st.name || id, name: st.name || st.acronym || id };
+  // Torn's stock log endpoint returns at most 100 records. Splitting a full
+  // date window ensures every record is fetched without following a repeated
+  // pagination cursor. Coverage is saved only after a complete window.
+  const attempts = [];
+  async function apiJSON(path, params, report = () => {}) {
+    const url = new URL(path, API);
+    url.search = new URLSearchParams(params).toString();
+    for (let retry = 0; retry < 4; retry++) {
+      const current = Date.now();
+      while (attempts.length && current - attempts[0] >= 60000) attempts.shift();
+      if (attempts.length >= 45) {
+        const delay = 61000 - (current - attempts[0]);
+        report('Waiting ' + Math.ceil(delay / 1000) + 's for the API request limit…');
+        await wait(delay);
+        while (attempts.length && Date.now() - attempts[0] >= 60000) attempts.shift();
       }
-      GM_setValue(KEY_STOCK_MAP, map);
+      attempts.push(Date.now());
+      let response;
+      let data;
+      try {
+        response = await fetch(url.href, { cache: 'no-store' });
+        data = await response.json();
+      } catch (error) {
+        if (retry === 3) throw error;
+        report('Connection interrupted; retrying…');
+        await wait(2000 * (retry + 1));
+        continue;
+      }
+      if (response.status === 429 || response.status === 503 || data?.error?.code === 5) {
+        if (retry === 3) throw new Error('Torn is still rate limiting requests. Try again to continue.');
+        report('Torn is rate limiting requests; waiting 65s…');
+        await wait(65000);
+        continue;
+      }
+      if (data?.error) throw new Error('API error ' + data.error.code + ': ' + data.error.error);
+      if (!response.ok || !data) throw new Error('Unexpected API response (HTTP ' + response.status + ').');
+      return data;
+    }
+    throw new Error('Could not reach the Torn API.');
+  }
+
+  async function stockMapFor(key, report) {
+    const saved = readObject(KEY.stockMap);
+    if (Object.keys(saved).length) return saved;
+    try {
+      const data = await apiJSON('/torn/', { selections: 'stocks', key }, report);
+      const map = {};
+      for (const [id, stock] of Object.entries(data.stocks || {})) {
+        map[id] = { acronym: stock.acronym || stock.name || id, name: stock.name || id };
+      }
+      if (Object.keys(map).length) GM_setValue(KEY.stockMap, map);
       return map;
+    } catch {
+      return {};
     }
-    return {};
   }
 
-  // ------------------ Logs fetch --------------
-  async function fetchLogsWindow(key, from, to) {
-    let pages = 0, cursorTo = to, all = [], lastStatus = '';
-    while (pages < MAX_PAGES && all.length < MAX_LOGS) {
-      const url = buildURL('user', { selections: 'log', from, to: cursorTo, key });
-      const { status, data } = await fetchJSON(url);
-      lastStatus = `HTTP ${status}`;
-      if (!data) break;
-      if (data.error) throw new Error(`API error ${data.error.code}: ${data.error.error}`);
-
-      const chunk = data.log || {};
-      const entries = Object.entries(chunk)
-        .map(([id, obj]) => ({ id, ...obj }))
-        .sort((a,b) => b.timestamp - a.timestamp);
-
-      if (!entries.length) break;
-
-      all = all.concat(entries);
-
-      const oldest = entries[entries.length - 1].timestamp;
-      if (oldest <= from) break;
-      cursorTo = oldest - 1;
-      pages++;
+  async function accountSignup(key, report) {
+    const saved = Number(GM_getValue(KEY.signup, 0));
+    if (Number.isSafeInteger(saved) && saved > 0 && saved <= now()) return saved;
+    const data = await apiJSON('/v2/user/profile', { key }, report);
+    const signup = Number(data.profile?.signed_up);
+    if (!Number.isSafeInteger(signup) || signup <= 0 || signup > now()) {
+      throw new Error('Could not read your account creation date.');
     }
-    return { all, lastStatus };
+    GM_setValue(KEY.signup, signup);
+    return signup;
   }
 
-  // ------------------ Extractors --------------
-  function extractFields(entry) {
-    const d = entry?.data || {};
-
-    // Robust number parsing (handles "1,234.56", "$1,234.56", etc.)
-    const toNum = (v) => {
-      if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-      if (typeof v === 'string') {
-        const cleaned = v.replace(/[^0-9.]/g, '');
-        if (!cleaned) return null;
-        const n = parseFloat(cleaned);
-        return Number.isFinite(n) ? n : null;
-      }
-      return null;
+  function normalizeTrade(raw) {
+    const id = raw?.id == null ? '' : String(raw.id);
+    const timestamp = Number(raw?.timestamp);
+    const type = Number(raw?.details?.id);
+    if (!id || !Number.isSafeInteger(timestamp) || (type !== STOCK_BUY && type !== STOCK_SELL)) {
+      throw new Error('The API returned an unexpected stock trade.');
+    }
+    return {
+      id, timestamp, log: type, category: raw.details?.category || 'Stock',
+      data: raw.data || {}, params: raw.params || {}
     };
-
-    const stockId =
-      (typeof d.stock === 'number') ? d.stock :
-      (typeof d.stock === 'string' && /^\d+$/.test(d.stock)) ? Number(d.stock) :
-      null;
-
-    let shares = toNum(d.amount);
-    let gross  = toNum(d.worth); // SELL (5511): Torn's NET
-    let price  = toNum(d.price);
-
-    if (price == null && shares != null && gross != null && shares > 0) price = gross / shares;
-    if (gross == null && shares != null && price != null) gross = shares * price;
-
-    return { stockId, shares, gross, price };
   }
 
-  // ------------------ Ledger + Rows -----------
-  function buildLedgerAndRows(entries, stockMap, manualMap) {
-    const stockEntries = entries.filter(x => s(x.category || x.cat || '').toLowerCase().includes('stock'));
-    const tradeEvents = stockEntries
-      .map(x => {
-        const isNumeric = typeof x.log === 'number' || /^\d+$/.test(s(x.log));
-        const typeId = isNumeric ? Number(x.log) : null;
-        if (typeId !== TYPE_BUY && typeId !== TYPE_SELL) return null;
-        const f = extractFields(x);
-        if (f.shares == null || f.gross == null) return null;
-        const stockKey = f.stockId != null ? String(f.stockId) : '';
-        const ticker = stockKey ? (stockMap?.[stockKey]?.acronym || stockMap?.[stockKey] || stockKey) : '—';
+  function mergeTrades(entries) {
+    const cache = readObject(KEY.logs);
+    let added = 0;
+    for (const entry of entries) {
+      if (!cache[entry.id]) added++;
+      cache[entry.id] = entry;
+    }
+    GM_setValue(KEY.logs, cache);
+    return added;
+  }
 
+  async function importRange(key, start, end, fresh, report) {
+    const intervals = fresh ? [[start, end]] : missingIntervals(start, end);
+    const queue = windowsFor(intervals);
+    let requests = 0;
+    let added = 0;
+    while (queue.length) {
+      const [first, last] = queue[0];
+      report({ requests, added, pending: queue.length,
+        message: 'Checking ' + new Date(first * 1000).toLocaleDateString() +
+          ' – ' + new Date(last * 1000).toLocaleDateString() + '…' });
+      const data = await apiJSON('/v2/user/log', {
+        log: STOCK_BUY + ',' + STOCK_SELL, limit: PAGE_LIMIT,
+        from: first, to: last, key
+      }, message => report({ requests, added, pending: queue.length, message }));
+      if (!Array.isArray(data.log) || !data._metadata?.links ||
+          !('next' in data._metadata.links)) {
+        throw new Error('The stock log API response was incomplete. Progress was saved.');
+      }
+      requests++;
+      const entries = data.log.map(normalizeTrade);
+      if (entries.some(entry => entry.timestamp < first || entry.timestamp > last)) {
+        throw new Error('The API returned trades outside the requested dates. Progress was saved.');
+      }
+      added += mergeTrades(entries);
+      if (entries.length >= PAGE_LIMIT || data._metadata.links.next) {
+        if (first === last) {
+          throw new Error('More than 100 trades occurred in one second. Progress was saved.');
+        }
+        const middle = first + Math.floor((last - first) / 2);
+        queue.splice(0, 1, [middle + 1, last], [first, middle]);
+        continue;
+      }
+      markCovered(first, last);
+      queue.shift();
+      report({ requests, added, pending: queue.length,
+        message: requests + ' requests · ' + added + ' new trades · ' + queue.length + ' windows left' });
+    }
+    return { requests, added };
+  }
+
+  function ledgerRows(logs, stockMap, manual) {
+    const events = logs
+      .filter(log => Number(log?.log) === STOCK_BUY || Number(log?.log) === STOCK_SELL)
+      .map(log => {
+        const shares = number(log.data?.amount);
+        const worth = number(log.data?.worth);
+        let price = number(log.data?.price);
+        if (price == null && shares > 0 && worth != null) price = worth / shares;
+        const spent = worth ?? (shares != null && price != null ? shares * price : null);
+        if (!Number.isSafeInteger(Number(log.timestamp)) || !shares || shares <= 0 || spent == null) return null;
+        const stockId = String(log.data?.stock ?? '');
+        const stock = stockMap[stockId];
+        const ticker = typeof stock === 'string' ? stock : stock?.acronym || stockId || '—';
         return {
-          id: x.id, ts: x.timestamp, when: asDate(x.timestamp),
-          action: typeId === TYPE_BUY ? 'BUY' : 'SELL',
-          ticker, shares: f.shares, price: f.price, gross: f.gross, raw: x, stockId: stockKey
+          id: String(log.id), ts: Number(log.timestamp), ticker,
+          action: Number(log.log) === STOCK_BUY ? 'BUY' : 'SELL',
+          shares, price, spent
         };
       })
       .filter(Boolean)
-      .sort((a,b)=> a.ts - b.ts);
+      .sort((a, b) => a.ts - b.ts || a.id.localeCompare(b.id, undefined, { numeric: true }));
 
-    const ledger = new Map(); // ticker -> { shares, cost }
+    const holdings = new Map();
     const rows = [];
-
-    for (const ev of tradeEvents) {
-      const key = ev.ticker;
-      if (!ledger.has(key)) ledger.set(key, { shares: 0, cost: 0 });
-      const lot = ledger.get(key);
-
-      if (ev.action === 'BUY') {
-        lot.shares += ev.shares;
-        lot.cost   += ev.gross;
+    for (const event of events) {
+      const lot = holdings.get(event.ticker) || { shares: 0, cost: 0 };
+      holdings.set(event.ticker, lot);
+      if (event.action === 'BUY') {
+        lot.shares += event.shares;
+        lot.cost += event.spent;
         rows.push({
-          ...ev,
-          fee: 0, net: null,
-          buyPrice: ev.price, sellPrice: null,
-          costTotal: ev.gross, profit: null, manual: false, editable: false
+          ...event, buyPrice: event.price, sellPrice: null, gross: null,
+          fee: 0, cost: event.spent, net: null, profit: null, manual: false, editable: false
         });
-      } else {
-        const priceCents = Math.round((ev.price ?? 0) * 100);
-        const shares = Number(ev.shares ?? 0);
-        const grossExactCents = priceCents * shares;
-        const grossExact = grossExactCents / 100;
-        const fee = Math.ceil(grossExact * 0.001);
-        const netExact = grossExact - fee;
-        const net = Math.floor(netExact);
-        const grossDisplay = net + fee;
-
-        const currentAvg = (lot.shares > 0) ? (lot.cost / lot.shares) : null;
-
-        let costTotal = null, profit = null, buyPriceOut = currentAvg, manualUsed = false, editable = false;
-
-        if (currentAvg != null) {
-          costTotal = currentAvg * ev.shares;
-          profit = net - costTotal;
-          lot.shares -= ev.shares;
-          lot.cost   -= costTotal;
-          if (lot.shares < 0) { lot.shares = 0; lot.cost = 0; }
-        } else {
-          const manual = manualMap && manualMap[ev.id];
-          if (manual && typeof manual.buyPrice === 'number' && isFinite(manual.buyPrice) && manual.buyPrice > 0) {
-            buyPriceOut = manual.buyPrice;
-            costTotal   = manual.buyPrice * ev.shares;
-            profit      = net - costTotal;
-            manualUsed  = true;
-          } else {
-            editable = true;
-          }
+        continue;
+      }
+      const gross = Math.round((event.price ?? 0) * 100) * event.shares / 100;
+      const fee = Math.ceil(gross * 0.001);
+      const net = Math.floor(gross - fee);
+      let buyPrice = lot.shares > 0 ? lot.cost / lot.shares : null;
+      let manualUsed = false;
+      if (buyPrice == null) {
+        const override = Number(manual[event.id]?.buyPrice);
+        if (Number.isFinite(override) && override > 0) {
+          buyPrice = override;
+          manualUsed = true;
         }
+      } else {
+        const costRemoved = buyPrice * event.shares;
+        lot.shares -= event.shares;
+        lot.cost -= costRemoved;
+        if (lot.shares <= 0) { lot.shares = 0; lot.cost = 0; }
+      }
+      const cost = buyPrice == null ? null : buyPrice * event.shares;
+      rows.push({
+        ...event, buyPrice, sellPrice: event.price, gross: net + fee,
+        fee, cost, net, profit: cost == null ? null : net - cost,
+        manual: manualUsed, editable: buyPrice == null
+      });
+    }
+    return rows.reverse();
+  }
 
-        rows.push({
-          ...ev, gross: grossDisplay, fee, net,
-          buyPrice: buyPriceOut, sellPrice: ev.price,
-          costTotal, profit, manual: manualUsed, editable
-        });
+  GM_addStyle(`
+    #tsl-link{display:inline-block;margin-left:12px;padding-left:12px;border-left:1px solid #77343c;
+      color:#ed5863!important;font-size:12px;font-weight:700;text-decoration:none;white-space:nowrap}
+    #tsl-link:hover{text-decoration:underline}
+    #tsl-page{--bg:#0e0b0d;--surface:#191316;--raised:#25191d;--line:#4b2b32;
+      --text:#f6eef0;--muted:#b9a6aa;--red:#e44756;--green:#93dcbe;
+      display:block;box-sizing:border-box;width:100%;min-width:0;min-height:600px;margin:12px 0 24px;
+      background:var(--bg);color:var(--text);border:1px solid var(--line);
+      border-radius:11px;font:13px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      box-shadow:0 14px 36px #0004;overflow:hidden}
+    #tsl-page *{box-sizing:border-box}
+    #tsl-page button,#tsl-page input,#tsl-page select{font:inherit}
+    #tsl-page button{cursor:pointer}
+    #tsl-page .header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:20px;
+      padding:20px 24px;background:linear-gradient(110deg,#34191e,#1c1316 57%,#110d0f);
+      border-bottom:1px solid #72353f}
+    #tsl-page .heading{display:flex;align-items:center;gap:13px;min-width:0}
+    #tsl-page .mark{display:grid;place-items:center;width:35px;height:35px;border-radius:9px;
+      background:var(--red);color:#1a080c;font-size:20px;font-weight:900}
+    #tsl-page h2{margin:0;color:var(--text);font-size:18px;line-height:1.2}
+    #tsl-page .subtitle{color:#d7a5ad;font-size:11px;letter-spacing:.09em;text-transform:uppercase}
+    #tsl-page .back{color:#ff8790!important;white-space:nowrap;text-decoration:none;font-weight:700}
+    #tsl-page .back:hover{text-decoration:underline}
+    #tsl-page .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:9px;padding:12px 20px;
+      background:var(--surface);border-bottom:1px solid var(--line)}
+    #tsl-page .toolbar.secondary{background:#140f11}
+    #tsl-page .toolbar-group{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-width:0;max-width:100%}
+    #tsl-page .spacer{flex:1 1 12px}
+    #tsl-page label{color:var(--muted);font-size:11px;font-weight:700}
+    #tsl-page .button{min-height:33px;padding:6px 11px;border:1px solid #66414a!important;
+      border-radius:7px;background:#291d20!important;color:var(--text)!important;font-weight:700}
+    #tsl-page .button:hover{background:#3c272d!important;border-color:#ba6270!important}
+    #tsl-page .button.active,#tsl-page .button.primary{background:#bb3342!important;
+      border-color:#ef6472!important;color:#fff!important}
+    #tsl-page .button:disabled{opacity:.55;cursor:default}
+    #tsl-page input,#tsl-page select{height:33px;padding:5px 9px;border-radius:7px;
+      border:1px solid #64414a!important;background:#100c0e!important;color:var(--text)!important;
+      color-scheme:dark}
+    #tsl-page input[type=date]{width:137px;max-width:100%}
+    #tsl-page #tsl-key{width:190px;max-width:100%}
+    #tsl-page .progress{height:5px;background:#281a1e;overflow:hidden}
+    #tsl-page .progress>span{display:block;width:0;height:100%;background:var(--red);
+      transition:width .15s ease}
+    #tsl-page .progress.running:not(.measured)>span{width:32%;
+      animation:tsl-loading 1.3s linear infinite}
+    @keyframes tsl-loading{from{transform:translateX(-110%)}to{transform:translateX(420%)}}
+    #tsl-page .filterbar{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:10px 20px;
+      border-bottom:1px solid var(--line);background:#201519}
+    #tsl-page #tsl-count{color:var(--muted);font-size:11px}
+    #tsl-page .tabs{display:flex;flex-wrap:wrap;gap:7px;padding:14px 20px 3px}
+    #tsl-page .tab{padding:6px 10px;border-radius:7px;border:1px solid #624049!important;
+      background:#21171a!important;color:#eadadd!important;font-weight:700}
+    #tsl-page .tab.active{border-color:#f47681!important;background:#a92d3b!important;color:#fff!important}
+    #tsl-page .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));
+      gap:10px;padding:13px 20px 18px}
+    #tsl-page .card{min-width:0;padding:13px;border-radius:9px;border:1px solid var(--line);
+      background:var(--surface)}
+    #tsl-page .card.profit{background:#28161b;border-color:#8a3442}
+    #tsl-page .card small{display:block;color:var(--muted);font-size:10px;font-weight:700;
+      letter-spacing:.06em;text-transform:uppercase}
+    #tsl-page .card strong{display:block;margin-top:5px;font-size:clamp(14px,1.8vw,20px);
+      overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+    #tsl-page .card strong.positive{color:var(--green)}
+    #tsl-page .card strong.negative{color:#ff8a96}
+    #tsl-page .trades{display:grid;width:100%;min-width:0;gap:6px;padding:0 20px 20px}
+    #tsl-page .trade-card{display:block;width:100%;min-width:0;
+      border:1px solid var(--line);border-radius:8px;background:var(--surface);overflow:hidden}
+    #tsl-page .trade-card:nth-child(2n){background:#21181b}
+    #tsl-page .trade-card:hover,#tsl-page .trade-card.selected{background:#49272f}
+    #tsl-page .trade-main{display:grid;width:100%;min-width:0;
+      grid-template-columns:repeat(auto-fit,minmax(min(100%,90px),1fr));
+      gap:2px;padding:6px 7px;border:0!important;border-radius:0!important;
+      background:transparent!important;color:var(--text)!important;text-align:center;
+      white-space:normal!important;font-size:11.9px!important;line-height:1.25}
+    #tsl-page .trade-main:focus-visible{outline:2px solid var(--red);outline-offset:-2px}
+    #tsl-page .trade-cell,#tsl-page .trade-field{display:block;min-width:0;
+      padding:5px 4px;text-align:center;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+    #tsl-page .trade-cell{padding:3px 2px}
+    #tsl-page .trade-cell small,#tsl-page .trade-field small{display:block;margin-bottom:3px;color:var(--muted);
+      font-size:10px;font-weight:700;text-transform:uppercase}
+    #tsl-page .trade-cell small{font-size:9.2px!important;margin-bottom:2px}
+    #tsl-page .trade-value{display:block;min-width:0;max-width:100%;white-space:normal;
+      overflow-wrap:anywhere}
+    #tsl-page .trade-cell .trade-value{font-weight:700}
+    #tsl-page .trade-cell:first-child{display:grid;place-items:center}
+    #tsl-page .trade-cell:first-child .trade-value{font-size:13.2px;font-weight:900}
+    #tsl-page .trade-details{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,155px),1fr));
+      gap:6px;padding:10px;border-top:1px solid var(--line);background:#170f12}
+    #tsl-page .trade-details[hidden]{display:none}
+    #tsl-page .buy{color:var(--green);font-weight:800}
+    #tsl-page .sell,#tsl-page .negative{color:#ff96a0;font-weight:800}
+    #tsl-page .positive{color:var(--green);font-weight:800}
+    #tsl-page .edit{margin-left:5px;border:1px solid #8d5963!important;border-radius:5px;
+      background:#342127!important;color:var(--text)!important}
+    #tsl-page .edit-input{width:96px;max-width:100%;height:26px;padding:2px 5px}
+    #tsl-page .note{padding:24px 20px;text-align:center;color:var(--muted)}
+    #tsl-page .footer{display:flex;flex-wrap:wrap;justify-content:space-between;gap:14px;align-items:center;
+      padding:12px 20px;border-top:1px solid var(--line);background:#1b1316;color:var(--muted)}
+    #tsl-page #tsl-status{overflow-wrap:anywhere}
+    @media(max-width:850px){
+      #tsl-page .header,#tsl-page .toolbar,#tsl-page .filterbar{padding-left:12px;padding-right:12px}
+      #tsl-page .tabs{padding-left:12px}
+      #tsl-page .summary{padding-left:12px;padding-right:12px}
+      #tsl-page .trades{padding-left:12px;padding-right:12px}
+    }
+  `);
+
+  function makePage() {
+    const page = document.createElement('section');
+    page.id = 'tsl-page';
+    page.innerHTML = `
+      <div class="header">
+        <div class="heading"><span class="mark">S</span>
+          <div><h2>Torn Stock Ledger</h2><div class="subtitle">Trades · Costs · Profit</div></div>
+        </div>
+        <a class="back" href="/page.php?sid=stocks">Back to Stocks</a>
+      </div>
+      <div class="toolbar">
+        <div class="toolbar-group">
+          <label>View</label>
+          <button class="button" type="button" data-days="7">7D</button>
+          <button class="button" type="button" data-days="14">14D</button>
+          <button class="button" type="button" data-days="30">30D</button>
+          <button id="tsl-full" class="button" type="button">Full History</button>
+        </div>
+        <div class="toolbar-group">
+          <label for="tsl-from">From</label><input id="tsl-from" type="date">
+          <label for="tsl-to">To</label><input id="tsl-to" type="date">
+          <button id="tsl-clear-dates" class="button" type="button">Clear Dates</button>
+        </div>
+        <span class="spacer"></span>
+        <button id="tsl-pull" class="button primary" type="button">Pull Now</button>
+      </div>
+      <div class="toolbar secondary">
+        <span class="spacer"></span>
+        <div class="toolbar-group">
+          <label for="tsl-key">Full Access API key</label>
+          <input id="tsl-key" type="password" autocomplete="off" placeholder="Stored in Tampermonkey">
+          <button id="tsl-test" class="button" type="button">Test Key</button>
+        </div>
+        <div class="toolbar-group">
+          <button id="tsl-clear-manual" class="button" type="button">Clear Manual</button>
+          <button id="tsl-clear-cache" class="button" type="button">Clear Cache</button>
+        </div>
+      </div>
+      <div class="progress" id="tsl-progress" role="progressbar"
+        aria-label="History dates checked" aria-valuemin="0" aria-valuemax="100"><span></span></div>
+      <div class="filterbar">
+        <label for="tsl-action">Action</label>
+        <select id="tsl-action"><option value="ALL">All trades</option>
+          <option value="BUY">Buys only</option><option value="SELL">Sells only</option></select>
+        <button id="tsl-clear-filters" class="button" type="button">Clear Filters</button>
+        <span class="spacer"></span><span id="tsl-count">No trades loaded</span>
+      </div>
+      <div id="tsl-tabs" class="tabs"></div>
+      <div id="tsl-summary" class="summary"></div>
+      <div id="tsl-results" class="trades">
+        <div class="note">Select a date range or choose Full History.</div>
+      </div>
+      <div class="footer"><span id="tsl-status">Ready</span>
+        <span>Made by Eaglewing [571041]</span></div>`;
+
+    const find = (selector) => page.querySelector(selector);
+    const keyInput = find('#tsl-key');
+    const fromInput = find('#tsl-from');
+    const toInput = find('#tsl-to');
+    const progress = find('#tsl-progress');
+    const status = find('#tsl-status');
+    const action = find('#tsl-action');
+    const savedRange = String(GM_getValue(KEY.range, '7'));
+    const state = {
+      days: ['7', '14', '30'].includes(savedRange) ? savedRange : '7',
+      ticker: String(GM_getValue(KEY.ticker, 'ALL')),
+      stockMap: readObject(KEY.stockMap), view: null, busy: false
+    };
+    keyInput.value = String(GM_getValue(KEY.api, ''));
+    fromInput.value = String(GM_getValue(KEY.from, ''));
+    toInput.value = String(GM_getValue(KEY.to, ''));
+
+    function setStatus(message) { status.textContent = message; }
+    function setBusy(busy) {
+      state.busy = busy;
+      page.querySelectorAll('#tsl-pull,#tsl-full,[data-days],#tsl-test').forEach(button => {
+        button.disabled = busy;
+      });
+      progress.classList.toggle('running', busy);
+      if (!busy) progress.classList.remove('measured');
+    }
+    function setProgress(start, end, message) {
+      if (start != null) {
+        const percent = Math.min(100, Math.floor(
+          coveredSeconds(start, end) * 100 / (end - start + 1)));
+        progress.classList.add('measured');
+        progress.firstElementChild.style.width = percent + '%';
+        progress.setAttribute('aria-valuenow', String(percent));
+        setStatus(percent + '% of account dates checked · ' + message);
+      } else {
+        progress.classList.remove('measured');
+        progress.removeAttribute('aria-valuenow');
+        setStatus(message);
       }
     }
+    function updateRangeButtons() {
+      page.querySelectorAll('[data-days]').forEach(button => {
+        button.classList.toggle('active',
+          !fromInput.value && !toInput.value && button.dataset.days === state.days);
+      });
+    }
+    updateRangeButtons();
 
-    return rows.sort((a,b)=> b.ts - a.ts);
-  }
+    function addField(card, labelText, value, className = '', fieldClass = 'trade-field') {
+      const field = document.createElement(fieldClass === 'trade-cell' ? 'span' : 'div');
+      field.className = fieldClass;
+      const label = document.createElement('small');
+      label.textContent = labelText;
+      const content = document.createElement('span');
+      content.className = 'trade-value' + (className ? ' ' + className : '');
+      content.textContent = value;
+      if (labelText) field.appendChild(label);
+      field.appendChild(content);
+      card.appendChild(field);
+      return content;
+    }
 
-  // ------------------ Render: Trades ----------
-  function renderSummary(container, rows) {
-    const sells = rows.filter(r => r.action === 'SELL');
-    const totalBuy  = sells.reduce((a,r)=> a + (r.costTotal || 0), 0);
-    const totalSell = sells.reduce((a,r)=> a + (r.net       || 0), 0);
-    const totalFee  = sells.reduce((a,r)=> a + (r.fee       || 0), 0);
-    const totalProf = sells.reduce((a,r)=> a + (r.profit    || 0), 0);
+    function render() {
+      const view = state.view;
+      if (!view) return;
+      const logs = Object.values(readObject(KEY.logs))
+        .filter(log => Number(log?.timestamp) <= view.to);
+      const all = ledgerRows(logs, state.stockMap, readObject(KEY.manual))
+        .filter(row => row.ts >= view.from && row.ts <= view.to);
+      const tickers = [...new Set(all.map(row => row.ticker))].sort();
+      if (state.ticker !== 'ALL' && !tickers.includes(state.ticker)) state.ticker = 'ALL';
+      const tabs = find('#tsl-tabs');
+      tabs.replaceChildren();
+      for (const ticker of ['ALL', ...tickers]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tab' + (ticker === state.ticker ? ' active' : '');
+        button.textContent = ticker;
+        button.addEventListener('click', () => {
+          state.ticker = ticker;
+          GM_setValue(KEY.ticker, ticker);
+          render();
+        });
+        tabs.appendChild(button);
+      }
 
-    container.innerHTML = `
-      <div class="tdtl-summary">
-        <div class="card"><div class="tdtl-muted">Total Buy</div><div style="font-weight:700">${money0(totalBuy)}</div></div>
-        <div class="card"><div class="tdtl-muted">Total Sell</div><div style="font-weight:700">${money0(totalSell)}</div></div>
-        <div class="card"><div class="tdtl-muted">Profit</div><div style="font-weight:700">${money0(totalProf)}</div></div>
-        <div class="card"><div class="tdtl-muted">Fees Paid</div><div style="font-weight:700">${money0(totalFee)}</div></div>
-      </div>
-    `;
-  }
+      const stockRows = all.filter(row => state.ticker === 'ALL' || row.ticker === state.ticker);
+      const shown = stockRows.filter(row => action.value === 'ALL' || row.action === action.value);
+      const sells = stockRows.filter(row => row.action === 'SELL');
+      const totals = {
+        buy: sells.reduce((sum, row) => sum + (row.cost ?? 0), 0),
+        sell: sells.reduce((sum, row) => sum + row.net, 0),
+        profit: sells.reduce((sum, row) => sum + (row.profit ?? 0), 0),
+        fee: sells.reduce((sum, row) => sum + row.fee, 0)
+      };
+      const summary = find('#tsl-summary');
+      summary.replaceChildren();
+      for (const [label, value, special] of [
+        ['Total Buy', totals.buy, false], ['Total Sell', totals.sell, false],
+        ['Profit', totals.profit, true], ['Fees Paid', totals.fee, false]
+      ]) {
+        const card = document.createElement('div');
+        card.className = 'card' + (special ? ' profit' : '');
+        const caption = document.createElement('small');
+        caption.textContent = label;
+        const amount = document.createElement('strong');
+        amount.textContent = currency(value);
+        if (special) amount.className = value >= 0 ? 'positive' : 'negative';
+        card.append(caption, amount);
+        summary.appendChild(card);
+      }
+      find('#tsl-count').textContent =
+        'Showing ' + quantity(shown.length) + ' of ' + quantity(stockRows.length) +
+        ' trades · ' + view.label + ' · Select a row for details';
 
-  function attachRowSelection(tbody){
-    tbody.addEventListener('click', (e) => {
-      const tr = e.target.closest('tr');
-      const multi = e.ctrlKey || e.metaKey;
-      if (!tr) {
-        tbody.querySelectorAll('.tdtl-row-selected').forEach(r => r.classList.remove('tdtl-row-selected'));
+      const results = find('#tsl-results');
+      results.replaceChildren();
+      if (!shown.length) {
+        const note = document.createElement('div');
+        note.className = 'note';
+        note.textContent = stockRows.length ?
+          'No trades match the action filter.' : 'No stock trades found for ' + view.label + '.';
+        results.appendChild(note);
         return;
       }
-      if (multi) tr.classList.toggle('tdtl-row-selected');
-      else {
-        tbody.querySelectorAll('.tdtl-row-selected').forEach(r => { if (r !== tr) r.classList.remove('tdtl-row-selected'); });
-        tr.classList.add('tdtl-row-selected');
-      }
-    });
-  }
-
-  function renderTable(body, statusEl, rows, rawCount, stockCount, rangeDays, windowLabel, rowsWindowForTabs) {
-    if (!rows.length) {
-      body.innerHTML = `<div class="tdtl-empty">No BUY/SELL logs for ${windowLabel ? windowLabel : ('last ' + rangeDays + ' day(s)')}. (Pulled ${rawCount} → ${stockCount} stock logs)</div>`;
-      statusEl.textContent = `Done.`;
-      return;
-    }
-
-    const summaryEl = document.createElement('div');
-    summaryEl.className = 'tdtl-summary';
-
-    // Tabs (ALL + one per ticker in the current window)
-    const tabs = document.createElement('div');
-    tabs.className = 'tdtl-tabs';
-    const active = getActiveTicker();
-
-    const windowRows = Array.isArray(rowsWindowForTabs) ? rowsWindowForTabs : rows;
-    const tickers = uniqueTickers(windowRows);
-
-    const addTab = (label, value) => {
-      const btn = document.createElement('button');
-      btn.className = 'tdtl-tab' + ((active === value) ? ' active' : '');
-      btn.textContent = label;
-      btn.addEventListener('click', () => {
-        setActiveTicker(value);
-        document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
-      });
-      tabs.appendChild(btn);
-    };
-
-    addTab('ALL', 'ALL');
-    for (const t of tickers) addTab(t, t);
-
-    body.innerHTML = '';
-    body.appendChild(tabs);
-    body.appendChild(summaryEl);
-    renderSummary(summaryEl, rows);
-
-    const tbl = document.createElement('table');
-    tbl.className = 'tdtl-table';
-    tbl.innerHTML = `
-      <thead><tr>
-        <th>Action</th><th>When</th><th>Stock</th><th>Buy Price</th><th>Sell Price</th>
-        <th>Shares</th><th>Gross (Sell)</th><th>Fee (0.10%)</th><th>Total Buy</th><th>Total Sell</th><th>Profit</th>
-      </tr></thead>
-      <tbody></tbody>
-    `;
-    body.appendChild(tbl);
-    const tbody = tbl.querySelector('tbody');
-
-    for (const r of rows) {
-      const profitClass = (r.profit==null) ? '' : (r.profit>0 ? 'tdtl-profit-pos' : 'tdtl-profit-neg');
-      const tr = document.createElement('tr');
-      tr.dataset.rowId = r.id;
-
-      const buyPriceText = (r.buyPrice != null ? '$' + price2(r.buyPrice) : '—');
-      let buyCellHTML;
-      if (r.editable) {
-        buyCellHTML = `<span class="tdtl-buywrap"><span class="tdtl-bptext">${buyPriceText}</span>
-          <button class="tdtl-icon-btn tdtl-manual-btn" title="Set buy price">✎</button></span>`;
-      } else if (r.manual) {
-        buyCellHTML = `<span class="tdtl-buywrap"><span class="tdtl-bptext">${buyPriceText}</span>
-          <span class="tdtl-tag">manual</span></span>`;
-      } else {
-        buyCellHTML = `<span class="tdtl-buywrap"><span class="tdtl-bptext">${buyPriceText}</span></span>`;
-      }
-
-      tr.innerHTML = `
-        <td><span class="tdtl-pill ${r.action==='BUY'?'tdtl-buy':'tdtl-sell'}">${r.action}</span></td>
-        <td>${r.when}</td>
-        <td>${r.ticker ?? '—'}</td>
-        <td class="tdtl-buycell">${buyCellHTML}</td>
-        <td>${r.sellPrice != null ? '$' + price2(r.sellPrice) : '—'}</td>
-        <td>${r.shares    != null ? intFmt(r.shares) : '—'}</td>
-        <td>${r.action === 'BUY' ? '—' : (r.gross != null ? money0(r.gross) : '—')}</td>
-        <td>${r.fee       != null ? money0(r.fee) : '—'}</td>
-        <td>${r.costTotal != null ? money0(r.costTotal) : '—'}</td>
-        <td>${r.action === 'BUY' ? 'N/A' : (r.net != null ? money0(r.net) : '—')}</td>
-        <td class="${profitClass}">${r.profit!=null ? (r.profit>0?'+':'') + money0(r.profit) : '—'}</td>
-      `;
-      tbody.appendChild(tr);
-    }
-
-    // Enable clickable selection
-    attachRowSelection(tbody);
-
-    // Inline manual editor
-    tbody.addEventListener('click', (e) => {
-      const btn = e.target.closest('.tdtl-manual-btn');
-      if (!btn) return;
-      const cell = btn.closest('.tdtl-buycell');
-      const row = btn.closest('tr');
-      if (!cell || !row) return;
-
-      const currentTextEl = cell.querySelector('.tdtl-bptext');
-      const currentVal = Number((currentTextEl?.textContent || '').replace(/[^0-9.]/g,'')) || '';
-
-      const editor = document.createElement('span');
-      editor.className = 'tdtl-inline-editor';
-      editor.innerHTML = `<input type="number" step="0.01" min="0" value="${currentVal}">
-                          <button class="tdtl-icon-btn tdtl-ok" title="Save">✓</button>
-                          <button class="tdtl-icon-btn tdtl-cancel" title="Cancel">×</button>`;
-
-      const wrap = cell.querySelector('.tdtl-buywrap');
-      wrap.replaceWith(editor);
-      const input = editor.querySelector('input');
-      input.focus(); input.select();
-
-      const commit = () => {
-        const v = Number(input.value);
-        if (!isFinite(v) || v <= 0) {
-          notify('Invalid buy price.');
-          cancel();
-          return;
-        }
-        const rowId = row.dataset.rowId;
-        setManualBuy(rowId, v);
-        document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
-      };
-      const cancel = () => {
-        document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
-      };
-
-      editor.querySelector('.tdtl-ok').addEventListener('click', commit);
-      editor.querySelector('.tdtl-cancel').addEventListener('click', cancel);
-      input.addEventListener('keydown', (ev)=>{
-        if (ev.key === 'Enter') commit();
-        else if (ev.key === 'Escape') cancel();
-      });
-
-      // Right-click on buy cell clears manual for that row
-      row.addEventListener('contextmenu', (ev)=>{
-        if (!ev.target.closest('.tdtl-buycell')) return;
-        ev.preventDefault();
-        const rowId = row.dataset.rowId;
-        setManualBuy(rowId, null);
-        notify('Manual buy price cleared for this row.');
-        document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
-      }, { once: true });
-    });
-
-    const counts = rows.reduce((acc,r)=>{acc[r.action]=(acc[r.action]||0)+1; return acc;},{});
-    statusEl.innerHTML = `Done. Rows: ${rows.length} (BUY: ${counts.BUY||0} | SELL: ${counts.SELL||0}). <span class="tdtl-credit">Made by Eaglewing [571041]</span>`;
-  }
-
-  // ------------------ UI ----------------------
-  function createPanel() {
-    const wrap = document.createElement('div');
-    wrap.className = 'tdtl-wrap';
-    wrap.innerHTML = `
-      <div class="tdtl-header">
-        <div>${TITLE}</div>
-        <div><button class="tdtl-btn tdtl-close" title="Close">✕</button></div>
-      </div>
-
-      <div class="tdtl-controls">
-        <button data-range="7"  class="tdtl-btn">7D</button>
-        <button data-range="14" class="tdtl-btn">14D</button>
-        <button data-range="30" class="tdtl-btn">30D</button>
-        <span class="tdtl-muted" style="margin-left:6px">From</span>
-        <input id="tdtl-from" class="tdtl-date" type="date">
-        <span class="tdtl-muted">To</span>
-        <input id="tdtl-to" class="tdtl-date" type="date">
-        <button id="tdtl-clear-dates" class="tdtl-btn" title="Clear custom dates and use 7D/14D/30D buttons">Clear Dates</button>
-        <button id="tdtl-pull" class="tdtl-btn">Pull Now</button>
-        <button id="tdtl-test" class="tdtl-btn">Test Key</button>
-        <input id="tdtl-key" class="tdtl-input" type="password" placeholder="Full Access API key (stored locally)">
-        <button id="tdtl-clear-manual" class="tdtl-btn" title="Clear all manually-set BUY prices for SELL rows">Clear Manual</button>
-      </div>
-
-      <div class="tdtl-diagnostics">
-        <div id="tdtl-progress" class="tdtl-progress"><div class="tdtl-progress-bar"></div></div>
-      </div>
-
-      <div class="tdtl-body"><div class="tdtl-empty">Choose 7D / 14D / 30D, or set a custom From/To date range, then click <b>Pull Now</b>.</div></div>
-      <div class="tdtl-footer">
-        <div class="tdtl-muted" id="tdtl-status">Idle. <span class="tdtl-credit">Made by Eaglewing [571041]</span></div>
-      </div>
-    `;
-    document.body.appendChild(wrap);
-
-    restorePanelPos(wrap);
-
-    const savedKey = GM_getValue(KEY_API, '');
-    if (savedKey) wrap.querySelector('#tdtl-key').value = savedKey;
-
-    const lastRange = GM_getValue(KEY_LAST_RANGE, '7');
-    activateRangeButton(wrap, lastRange);
-
-    const fromEl = wrap.querySelector('#tdtl-from');
-    const toEl   = wrap.querySelector('#tdtl-to');
-    const clearDatesBtn = wrap.querySelector('#tdtl-clear-dates');
-
-    // Restore custom dates (if any)
-    if (fromEl) fromEl.value = GM_getValue(KEY_CUSTOM_FROM, '') || '';
-    if (toEl)   toEl.value   = GM_getValue(KEY_CUSTOM_TO, '') || '';
-
-    if (fromEl) fromEl.addEventListener('change', () => GM_setValue(KEY_CUSTOM_FROM, fromEl.value || ''));
-    if (toEl)   toEl.addEventListener('change', () => GM_setValue(KEY_CUSTOM_TO, toEl.value || ''));
-
-    if (clearDatesBtn) clearDatesBtn.addEventListener('click', () => {
-      if (fromEl) fromEl.value = '';
-      if (toEl) toEl.value = '';
-      GM_setValue(KEY_CUSTOM_FROM, '');
-      GM_setValue(KEY_CUSTOM_TO, '');
-      notify('Custom dates cleared (using 7D/14D/30D).');
-    });
-
-    const progressEl = wrap.querySelector('#tdtl-progress');
-    const body = wrap.querySelector('.tdtl-body');
-    const statusEl = wrap.querySelector('#tdtl-status');
-
-    const setLoading = (on) => { if (on) progressEl.classList.add('active'); else progressEl.classList.remove('active'); };
-
-    wrap.querySelector('.tdtl-close').addEventListener('click', () => wrap.remove());
-    wrap.querySelectorAll('[data-range]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const r = btn.getAttribute('data-range');
-        GM_setValue(KEY_LAST_RANGE, r);
-        activateRangeButton(wrap, r);
-
-        // Switching to a preset range clears any custom date selection
-        const fromEl = wrap.querySelector('#tdtl-from');
-        const toEl   = wrap.querySelector('#tdtl-to');
-        if (fromEl) fromEl.value = '';
-        if (toEl) toEl.value = '';
-        GM_setValue(KEY_CUSTOM_FROM, '');
-        GM_setValue(KEY_CUSTOM_TO, '');
-      });
-    });
-
-    const keyInput = wrap.querySelector('#tdtl-key');
-    keyInput.addEventListener('change', (e) => GM_setValue(KEY_API, e.target.value.trim()));
-
-    const pullBtn = wrap.querySelector('#tdtl-pull');
-    const testBtn = wrap.querySelector('#tdtl-test');
-    const clearBtn = wrap.querySelector('#tdtl-clear-manual');
-    clearBtn.addEventListener('click', () => {
-      if (confirm('Clear ALL manually-set BUY prices for SELL rows?')) {
-        clearAllManual();
-        notify('Manual BUY prices cleared.');
-        document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
-      }
-    });
-
-    let lastFetched = null;
-    async function doPull() {
-      const rangeDays = parseInt(GM_getValue(KEY_LAST_RANGE, '7'), 10);
-      const key = (keyInput.value || '').trim();
-      if (!key) return notify('Please paste your Full Access API key first.');
-      GM_setValue(KEY_API, key);
-
-      // Determine the requested time window:
-      // - If BOTH custom dates are set, use them (inclusive of the full 'To' day).
-      // - Otherwise, use the selected preset (7D/14D/30D).
-      const fromStr = (fromEl && fromEl.value) ? fromEl.value : '';
-      const toStr   = (toEl && toEl.value) ? toEl.value : '';
-
-      const isPresetRange = !(fromStr && toStr); // presets (7D/14D/30D) always fetch live
-
-      let from, to, label;
-      if (fromStr && toStr) {
-        from = dateStrToUnixStart(fromStr);
-        to   = dateStrToUnixEnd(toStr);
-        if (!isFinite(from) || !isFinite(to) || from > to) {
-          notify('Invalid custom date range. Please check From/To.');
-          return;
-        }
-        label = `${fromStr} → ${toStr}`;
-      } else {
-        to = unixNow();
-        from = daysAgoUnix(rangeDays);
-        label = `last ${rangeDays} day(s)`;
-      }
-
-      body.innerHTML = `<div class="tdtl-empty">Pulling logs for ${label}…</div>`;
-      statusEl.textContent = `Preparing ${label}…`;
-      setLoading(true);
-
-      try {
-        const stockMap = await loadStockMap(key);
-
-        // Fetch strategy:
-        // - Preset ranges (7D/14D/30D): ALWAYS fetch live data from the API (then merge into cache)
-        // - Custom date range: cache-aware (fetch ONLY missing parts)
-        if (isPresetRange) {
-          statusEl.textContent = `Fetching live logs for ${label}…`;
-          const { all } = await fetchLogsWindow(key, from, to);
-
-          // Merge into cache (dedupe by log id)
-          const cache = getLogCache();
-          for (const entry of all) {
-            if (entry && entry.id && !cache[entry.id]) cache[entry.id] = entry;
+      for (const [index, entry] of shown.entries()) {
+        const row = document.createElement('article');
+        row.className = 'trade-card';
+        const main = document.createElement('button');
+        main.type = 'button';
+        main.className = 'trade-main';
+        main.title = 'Show trade details';
+        main.setAttribute('aria-expanded', 'false');
+        const details = document.createElement('div');
+        details.className = 'trade-details';
+        details.id = 'tsl-details-' + index;
+        details.hidden = true;
+        main.setAttribute('aria-controls', details.id);
+        main.addEventListener('click', event => {
+          if (!event.ctrlKey && !event.metaKey) {
+            results.querySelectorAll('.trade-main[aria-expanded="true"]').forEach(other => {
+              if (other === main) return;
+              other.setAttribute('aria-expanded', 'false');
+              other.title = 'Show trade details';
+              other.nextElementSibling.hidden = true;
+              other.parentElement.classList.remove('selected');
+            });
           }
-          setLogCache(cache);
-          addCoverage(from, to);
-        } else {
-          // Cache-aware pull: fetch ONLY missing parts of the requested time window
-          await ensureRangeCached(key, from, to, statusEl);
+          const open = main.getAttribute('aria-expanded') !== 'true';
+          main.setAttribute('aria-expanded', String(open));
+          main.title = open ? 'Hide trade details' : 'Show trade details';
+          details.hidden = !open;
+          row.classList.toggle('selected', open);
+        });
+        addField(main, '', entry.action, entry.action.toLowerCase(), 'trade-cell');
+        addField(main, 'When', when(entry.ts), '', 'trade-cell');
+        addField(main, 'Stock', entry.ticker, '', 'trade-cell');
+        addField(main, 'Shares', quantity(entry.shares), '', 'trade-cell');
+        addField(main, entry.action === 'BUY' ? 'Buy Price' : 'Sell Price',
+          currency(entry.action === 'BUY' ? entry.buyPrice : entry.sellPrice, 2), '', 'trade-cell');
+        addField(main, 'Profit', entry.profit == null ? '—' :
+          (entry.profit > 0 ? '+' : '') + currency(entry.profit),
+          entry.profit == null ? '' : entry.profit >= 0 ? 'positive' : 'negative', 'trade-cell');
+        const buyCell = addField(details, 'Buy Price', currency(entry.buyPrice, 2));
+        if (entry.manual) {
+          buyCell.append(' (manual)');
         }
-
-        // Display window logs (what the user asked for)
-        const displayLogs = getCachedLogsInRange(from, to);
-
-        // OPTION 1 (ledger context): include prior BUY/SELL events from before the
-        // range start so SELLs inside the range can resolve buy price / average cost.
-        const contextLogs = getCachedLogsBefore(from);
-        const ledgerInput = contextLogs.concat(displayLogs);
-
-        statusEl.textContent = `Using ${displayLogs.length} cached log entries (+${contextLogs.length} prior for ledger). Building ledger…`;
-
-        const stockEntries = displayLogs.filter(x => s(x.category || x.cat || '').toLowerCase().includes('stock'));
-        const manualMap = getManualMap();
-
-        // Build ledger from context + display
-        const rowsAll = buildLedgerAndRows(ledgerInput, stockMap, manualMap);
-        const rowsWindow = rowsAll.filter(r => typeof r.ts === 'number' && r.ts >= from && r.ts <= to);
-
-        // If selected tab isn't in this window, reset to ALL
-        const active = getActiveTicker();
-        if (active !== 'ALL' && !rowsWindow.some(r => r.ticker === active)) setActiveTicker('ALL');
-
-        // Display filter only (ledger math stays correct)
-        const rows = filterRowsByTicker(rowsWindow);
-
-        lastFetched = { rowsWindow, rows, allLogs: displayLogs, stockEntriesCount: stockEntries.length, rangeDays, fromTs: from, toTs: to, windowLabel: label };
-        renderTable(body, statusEl, rows, displayLogs.length, stockEntries.length, rangeDays, label, rowsWindow);
-      } catch (e) {
-        body.innerHTML = `<div class="tdtl-empty">Error: ${(e && e.message) || e}</div>`;
-        statusEl.textContent = 'Error.';
-      } finally {
-        setLoading(false);
+        if (entry.editable || entry.manual) {
+          const edit = document.createElement('button');
+          edit.type = 'button';
+          edit.className = 'edit';
+          edit.textContent = '✎';
+          edit.title = 'Set or change buy price';
+          edit.addEventListener('click', () => {
+            buyCell.replaceChildren();
+            const input = document.createElement('input');
+            input.type = 'number';
+            input.min = '0.01';
+            input.step = '0.01';
+            input.className = 'edit-input';
+            input.value = entry.buyPrice ?? '';
+            const save = document.createElement('button');
+            save.type = 'button';
+            save.className = 'edit';
+            save.textContent = '✓';
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.className = 'edit';
+            cancel.textContent = '×';
+            const commit = () => {
+              const price = Number(input.value);
+              if (!Number.isFinite(price) || price <= 0) {
+                setStatus('Enter a buy price greater than zero.');
+                input.focus();
+                return;
+              }
+              const manual = readObject(KEY.manual);
+              manual[entry.id] = { buyPrice: price, ts: now() };
+              GM_setValue(KEY.manual, manual);
+              render();
+            };
+            save.addEventListener('click', commit);
+            cancel.addEventListener('click', render);
+            input.addEventListener('keydown', event => {
+              if (event.key === 'Enter') commit();
+              if (event.key === 'Escape') render();
+            });
+            buyCell.append(input, save, cancel);
+            input.focus();
+          });
+          buyCell.appendChild(edit);
+          if (entry.manual) {
+            buyCell.addEventListener('contextmenu', event => {
+              event.preventDefault();
+              const manual = readObject(KEY.manual);
+              delete manual[entry.id];
+              GM_setValue(KEY.manual, manual);
+              render();
+            }, { once: true });
+          }
+        }
+        addField(details, 'Sell Price', currency(entry.sellPrice, 2));
+        addField(details, 'Gross (Sell)', entry.action === 'BUY' ? '—' : currency(entry.gross));
+        addField(details, 'Fee (0.10%)', currency(entry.fee));
+        addField(details, 'Total Buy', currency(entry.cost));
+        addField(details, 'Total Sell', entry.action === 'BUY' ? 'N/A' : currency(entry.net));
+        row.append(main, details);
+        results.appendChild(row);
       }
     }
 
-    function softRefresh(){
-      if (!lastFetched) return doPull();
-      const { rangeDays, fromTs, toTs } = lastFetched;
-      const key = (keyInput.value || '').trim();
-      const manualMap = getManualMap();
-      (async () => {
-        setLoading(true);
-        try {
-          const stockMap = await loadStockMap(key);
-
-          // Rebuild from cached logs for the same window (no new API calls)
-          const from = (typeof fromTs === 'number' && isFinite(fromTs)) ? fromTs : daysAgoUnix(rangeDays);
-          const to   = (typeof toTs === 'number' && isFinite(toTs)) ? toTs : unixNow();
-
-          const displayLogs = getCachedLogsInRange(from, to);
-          const contextLogs = getCachedLogsBefore(from);
-          const ledgerInput = contextLogs.concat(displayLogs);
-          const stockEntriesCount = displayLogs.filter(x => s(x.category || x.cat || '').toLowerCase().includes('stock')).length;
-
-          const rowsAll = buildLedgerAndRows(ledgerInput, stockMap, manualMap);
-          const rowsWindow = rowsAll.filter(r => typeof r.ts === 'number' && r.ts >= from && r.ts <= to);
-
-          const active = getActiveTicker();
-          if (active !== 'ALL' && !rowsWindow.some(r => r.ticker === active)) setActiveTicker('ALL');
-
-          const rows = filterRowsByTicker(rowsWindow);
-
-          lastFetched.rowsWindow = rowsWindow;
-          lastFetched.rows = rows;
-          lastFetched.allLogs = displayLogs;
-          lastFetched.stockEntriesCount = stockEntriesCount;
-
-          renderTable(body, statusEl, rows, displayLogs.length, stockEntriesCount, rangeDays, lastFetched.windowLabel, rowsWindow);
-        } catch(e){
-          notify('Soft refresh failed: ' + (e && e.message || e));
-        } finally {
-          setLoading(false);
+    function selectedRange() {
+      const fromText = fromInput.value;
+      const toText = toInput.value;
+      if (fromText || toText) {
+        if (!fromText || !toText) throw new Error('Choose both From and To dates.');
+        const from = dateBoundary(fromText);
+        const to = dateBoundary(toText, true);
+        if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
+            from <= 0 || from > to || to > now() + DAY) {
+          throw new Error('Choose a valid From and To date range.');
         }
-      })();
+        return { from, to: Math.min(to, now()), label: fromText + ' → ' + toText, fresh: false };
+      }
+      const to = now();
+      return { from: to - Number(state.days) * DAY, to,
+        label: 'last ' + state.days + ' days', fresh: true };
     }
 
-    document.addEventListener('tdtl-refresh-now', softRefresh);
+    function currentKey() {
+      const key = keyInput.value.trim();
+      if (!key) throw new Error('Enter a Full Access API key first.');
+      GM_setValue(KEY.api, key);
+      return key;
+    }
 
-    pullBtn.addEventListener('click', doPull);
-
-    testBtn.addEventListener('click', async () => {
-      const key = (keyInput.value || '').trim();
-      if (!key) return notify('Please paste your Full Access API key first.');
-      setLoading(true);
+    async function pull() {
+      if (state.busy) return;
       try {
-        const url = buildURL('user', { selections: 'basic', key });
-        const { status, data } = await fetchJSON(url);
-        let msg;
-        if (data?.error) msg = `API error ${data.error.code}: ${data.error.error}`;
-        else if (status !== 200 || !data?.player_id) msg = `Unexpected response (HTTP ${status}).`;
-        else msg = `OK (player_id ${data.player_id})`;
-        notify(`Test key: ${msg}`);
-      } catch (e) {
-        notify(`Test key failed: ${(e && e.message) || e}`);
+        const key = currentKey();
+        const view = selectedRange();
+        state.view = view;
+        setBusy(true);
+        setProgress(null, null, 'Loading stock names…');
+        state.stockMap = await stockMapFor(key, setStatus);
+        const result = await importRange(key, view.from, view.to, view.fresh,
+          progressReport => setProgress(null, null, progressReport.message));
+        render();
+        setStatus(view.label + ': ' + result.added + ' new trades cached in ' +
+          result.requests + ' API requests.');
+      } catch (error) {
+        if (state.view) render();
+        setStatus(error.message || String(error));
       } finally {
-        setLoading(false);
+        setBusy(false);
+      }
+    }
+
+    async function fullHistory() {
+      if (state.busy) return;
+      try {
+        const key = currentKey();
+        setBusy(true);
+        setProgress(null, null, 'Reading your account creation date…');
+        const from = await accountSignup(key, setStatus);
+        const to = now();
+        state.view = { from, to, label: 'Full History' };
+        state.stockMap = await stockMapFor(key, setStatus);
+        const result = await importRange(key, from, to, false,
+          update => setProgress(from, to, update.message));
+        render();
+        setProgress(from, to, 'Full History: ' + result.added +
+          ' new trades cached in ' + result.requests + ' API requests.');
+      } catch (error) {
+        if (state.view) render();
+        setStatus('Full History: ' + (error.message || String(error)));
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    keyInput.addEventListener('change', () => {
+      if (keyInput.value.trim()) GM_setValue(KEY.api, keyInput.value.trim());
+    });
+    for (const input of [fromInput, toInput]) {
+      input.addEventListener('change', () => {
+        GM_setValue(KEY.from, fromInput.value);
+        GM_setValue(KEY.to, toInput.value);
+        updateRangeButtons();
+        if (fromInput.value && toInput.value && keyInput.value.trim()) pull();
+      });
+    }
+    page.querySelectorAll('[data-days]').forEach(button => {
+      button.addEventListener('click', () => {
+        state.days = button.dataset.days;
+        GM_setValue(KEY.range, state.days);
+        fromInput.value = '';
+        toInput.value = '';
+        GM_setValue(KEY.from, '');
+        GM_setValue(KEY.to, '');
+        updateRangeButtons();
+        if (keyInput.value.trim()) pull();
+      });
+    });
+    find('#tsl-clear-dates').addEventListener('click', () => {
+      fromInput.value = '';
+      toInput.value = '';
+      GM_setValue(KEY.from, '');
+      GM_setValue(KEY.to, '');
+      updateRangeButtons();
+      setStatus('Custom dates cleared. Select 7D, 14D or 30D to load trades.');
+    });
+    find('#tsl-pull').addEventListener('click', pull);
+    find('#tsl-full').addEventListener('click', fullHistory);
+    action.addEventListener('change', render);
+    find('#tsl-clear-filters').addEventListener('click', () => {
+      action.value = 'ALL';
+      state.ticker = 'ALL';
+      GM_setValue(KEY.ticker, 'ALL');
+      render();
+    });
+    find('#tsl-test').addEventListener('click', async () => {
+      if (state.busy) return;
+      try {
+        const key = currentKey();
+        setBusy(true);
+        setStatus('Checking your API key…');
+        const data = await apiJSON('/v2/user/profile', { key }, setStatus);
+        setStatus('API key works' + (data.profile?.name ? ' for ' + data.profile.name : '') + '.');
+      } catch (error) {
+        setStatus('API key test: ' + (error.message || String(error)));
+      } finally {
+        setBusy(false);
       }
     });
-
-    makeDraggable(wrap.querySelector('.tdtl-header'), wrap, () => savePanelPos(wrap));
-    window.addEventListener('beforeunload', () => savePanelPos(wrap));
-  }
-
-  // --------------- Helpers --------------------
-  function activateRangeButton(root, r) {
-    root.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
-    const active = root.querySelector(`[data-range="${r}"]`);
-    if (active) active.classList.add('active');
-  }
-
-  function addLauncher() {
-    const existing = document.querySelector('.tdtl-launcher');
-    if (existing) return;
-    const btn = document.createElement('button');
-    btn.textContent = 'Day Trader Logbook';
-    btn.className = 'tdtl-btn tdtl-launcher';
-    btn.addEventListener('click', () => { document.querySelector('.tdtl-wrap')?.remove(); createPanel(); });
-    document.body.appendChild(btn);
-  }
-
-  function onStocksPage() { return location.pathname === '/page.php' && new URLSearchParams(location.search).get('sid') === 'stocks'; }
-
-  GM_registerMenuCommand('Set Full Access API Key', () => {
-    const current = GM_getValue(KEY_API, '');
-    const next = prompt('Paste your Full Access API key:', current || '');
-    if (next !== null) GM_setValue(KEY_API, next.trim());
-  });
-  GM_registerMenuCommand('Clear ALL manual BUY prices', () => {
-    if (confirm('Clear ALL manually-set BUY prices for SELL rows?')) {
-      clearAllManual();
-      notify('Manual BUY prices cleared.');
-      document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
+    find('#tsl-clear-manual').addEventListener('click', () => {
+      if (!confirm('Clear all manually entered buy prices?')) return;
+      GM_setValue(KEY.manual, {});
+      render();
+      setStatus('Manual buy prices cleared.');
+    });
+    find('#tsl-clear-cache').addEventListener('click', () => {
+      if (!confirm('Clear all cached stock trades and verified history dates? You will need to import them again.')) return;
+      GM_setValue(KEY.logs, {});
+      GM_setValue(KEY.coverage, []);
+      render();
+      setStatus('Cached trade history cleared.');
+    });
+    find('.back').addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      location.assign(STOCKS_URL);
+    });
+    // Show already cached trades without making an API request on page load.
+    const cached = readObject(KEY.logs);
+    if (Object.keys(cached).length) {
+      try { state.view = selectedRange(); render(); } catch { /* Wait for both dates. */ }
     }
-  });
+    return page;
+  }
 
-  GM_registerMenuCommand('Clear cached log history', () => {
-    const msg =
-      'Clear ALL cached trade logs?\n\n' +
-      'This cannot be undone.\n\n' +
-      '• Your API key will NOT be removed\n' +
-      '• Manual BUY overrides will NOT be removed\n\n' +
-      'You will need to re-pull date ranges again.';
-    if (!confirm(msg)) return;
-    clearLogCacheWithCoverage();
-    notify('Cached log history cleared.');
-    document.dispatchEvent(new CustomEvent('tdtl-refresh-now'));
-  });
+  function insertLink(stockRoot) {
+    const header = stockRoot.querySelector('[class*="appHeaderWrapper"]');
+    const title = header?.querySelector('[class*="titleContainer"] h4');
+    const profit = title?.querySelector('.tt-total-stock-value');
+    if (!profit) return false;
+    let link = title.querySelector('#tsl-link');
+    if (!link) {
+      link = document.createElement('a');
+      link.id = 'tsl-link';
+      link.href = LEDGER_URL;
+      link.textContent = 'Torn Stock Ledger';
+      link.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        location.assign(LEDGER_URL);
+      });
+    }
+    if (link.previousElementSibling !== profit) profit.after(link);
+    return true;
+  }
 
-  if (onStocksPage()) { createPanel(); addLauncher(); }
+  function start() {
+    if (location.pathname !== '/page.php' ||
+        new URLSearchParams(location.search).get('sid') !== 'stocks') return;
+    const dedicated = new URLSearchParams(location.search).get('ewStockLedger') === '1';
+    let mounted = false;
+    let scheduled = false;
+    const mount = () => {
+      const stockRoot = document.getElementById('stockmarketroot');
+      if (!stockRoot) return;
+      if (dedicated) {
+        if (mounted) return;
+        stockRoot.replaceWith(makePage());
+        mounted = true;
+        observer.disconnect();
+      } else {
+        insertLink(stockRoot);
+      }
+    };
+    const observer = new MutationObserver(() => {
+      if (scheduled) return;
+      scheduled = true;
+      queueMicrotask(() => {
+        scheduled = false;
+        mount();
+      });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    mount();
+  }
+
+  start();
 })();
