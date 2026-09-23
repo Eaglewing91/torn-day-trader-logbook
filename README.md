@@ -1,59 +1,45 @@
-Torn Stock Ledger
+# Torn Stock Ledger
 
-Version 1.0.0 · Eaglewing [571041]
+**Stock trade history and profit tracking for Torn**  
+Version **1.0.0** · Created by **Eaglewing [571041]**
 
-Torn Stock Ledger is the newly developed, fully working release of Torn Day Trader Logbook (Experimental). It displays your Torn stock BUY and SELL history, costs, fees and profit on its own page within Torn.
+Torn Stock Ledger is the newly developed, fully working release of **Torn Day Trader Logbook (Experimental)**. It gives your stock trades a dedicated page within Torn, with a clear view of buying costs, selling fees and profit.
 
-Features
+## Install
 
-A Torn Stock Ledger link beside the value and profit figures on Torn's Stocks page; the ledger opens on a dedicated URL, without a floating panel.
+1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
+2. **[Install Torn Stock Ledger](https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js)** and confirm the installation in Tampermonkey.
+3. Open [Torn's Stocks page](https://www.torn.com/page.php?sid=stocks). Click **Torn Stock Ledger** next to the stock value and profit figures.
 
-7 / 14 / 30 day views, From / To dates and a one-click Full History import from your account creation date. Full History shows progress and may take a minute or two to obtain all available data.
+> **Upgrading?** Disable older Day Trader Logbook or Full History Test scripts in Tampermonkey to avoid their floating panels. If you installed an earlier copy of **1.0.0** with a broken update link, reinstall it once using the link above.
 
-A compact trade list showing BUY/SELL, date, stock, shares, price and profit. Select a row to see its buy and sell prices, gross sale, 0.10% sell fee and totals.
+## What it does
 
-Per-stock tabs and an All / BUY / SELL action filter.
+- Displays BUY and SELL trades on a dedicated Torn URL, with no floating panel.
+- Loads the last **7, 14 or 30 days**, a **From / To** date range, or **Full History**.
+- Shows a progress bar while importing full history, starting from your account creation date.
+- Displays buy and sell prices, shares, gross sale, the **0.10% sell fee**, and profit for each trade.
+- Calculates costs using the average cost of shares held; you can enter a buy price for an older sale when its cost is unknown.
+- Lets you select a stock and filter the visible rows to buys or sells.
+- Summarizes the cost basis, proceeds, fees and profit of sales in the selected dates and stock. The BUY/SELL row filter does not change these totals.
+- Caches imported trades locally so they can be displayed again without a full import.
 
-An average-cost ledger for merged stock positions, with a manual buy-price option when an older SELL has no known cost basis.
+## Getting started
 
-Summary figures for total buy cost, total sell proceeds, profit and fees for the selected date range and stock tab.
+1. Enter a **Full Access Torn API key** on the ledger page. You can use **Test Key** to check it.
+2. Choose **7D**, **14D**, **30D**, or both **From** and **To** dates. Choose **Full History** to retrieve all available account history with one click.
+3. Select a trade to see its full breakdown. Use **Pull Now** to refresh the selected range.
 
-Locally cached trade history in Tampermonkey, plus controls to test your API key, refresh trades and clear cached data.
+The first Full History import may take a minute or two. Its progress bar tracks the account dates checked. If an import stops, completed data remains cached and you can click **Full History** again to continue.
 
-Install
+## Data and accuracy
 
-Install Tampermonkey for your browser.
+Your API key and trade cache are stored locally in Tampermonkey. The key is sent to Torn's API to request your data. Torn's rounding may cause small differences between displayed calculations and settled amounts. A sale with no known buy cost shows no calculated profit until you enter a manual buy price.
 
-Install Torn Stock Ledger.
+## Updates
 
-If you previously used Torn Day Trader Logbook (Experimental) or a Full History Test script, disable those older scripts in Tampermonkey. They have their own floating panels.
+The install link points to `torn-day-trader-logbook.user.js`, the existing filename in this repository. The script's update URLs point to the same file. Future releases can update installed copies when their script version is increased.
 
-Usage
+## License
 
-Open Torn's Stocks page and select Torn Stock Ledger beside the profit figure.
-
-Enter your Full Access Torn API key. Use Test Key if you want to check it.
-
-Select 7D, 14D, 30D, set both From and To, or select Full History. The date controls load trades when a key is available; Pull Now refreshes the selected range.
-
-Use the stock tabs and action filter to inspect trades. Select a trade to expand its details.
-
-Full History starts with one click, checks your account creation date and retrieves the available stock logs. The first import may take a minute or two. Imported trades are cached locally so the ledger can display them again without repeating the full import.
-
-Data and accuracy
-
-Your API key and cached trades are stored in Tampermonkey on your device. The key is sent to Torn's API when the script requests data.
-
-Torn charges a 0.10% sell fee. Small differences can occur because of rounding.
-
-Profit and the summary figures are calculated from completed SELL trades in the selected date range and stock tab. The BUY/SELL action filter changes which rows are shown; it does not change those summary figures.
-
-Older SELL trades may have an unknown cost basis until you enter a manual buy price.
-
-Updates
-
-This release is 1.0.0. Install from the GitHub link above to receive future Tampermonkey updates when the version in torn-stock-ledger.user.js is increased.
-
-License
-
-MIT — see LICENSE.
+[MIT License](LICENSE)
