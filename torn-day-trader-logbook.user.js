@@ -4,8 +4,8 @@
 // @version      1.0.0
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
-// @updateURL   https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-stock-ledger.user.js
-// @downloadURL https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-stock-ledger.user.js
+// @updateURL   https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
+// @downloadURL https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // @description  Newly developed, fully working release of the original Torn Day Trader Logbook (Experimental), now named Torn Stock Ledger. View stock trades, costs, fees and profit for 7/14/30 days, custom dates, or full account history. Full History may take a minute or two to obtain all available data. Requires a Full Access API key.
 // @match        https://www.torn.com/page.php*
 // @run-at       document-idle
