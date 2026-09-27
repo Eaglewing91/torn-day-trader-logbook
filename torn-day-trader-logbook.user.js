@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.0.0
+// @version      1.0.2
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL   https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -352,6 +352,7 @@
     #tsl-page .back:hover{text-decoration:underline}
     #tsl-page .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:9px;padding:12px 20px;
       background:var(--surface);border-bottom:1px solid var(--line)}
+    #tsl-page .toolbar.dates{background:#1b1215}
     #tsl-page .toolbar.secondary{background:#140f11}
     #tsl-page .toolbar-group{display:flex;align-items:center;flex-wrap:wrap;gap:8px;min-width:0;max-width:100%}
     #tsl-page .spacer{flex:1 1 12px}
@@ -391,6 +392,9 @@
       overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
     #tsl-page .card strong.positive{color:var(--green)}
     #tsl-page .card strong.negative{color:#ff8a96}
+    #tsl-page .card .roi{display:block;margin-top:4px;font-size:12px;font-weight:700}
+    #tsl-page .card .roi.positive{color:var(--green)}
+    #tsl-page .card .roi.negative{color:#ff8a96}
     #tsl-page .trades{display:grid;width:100%;min-width:0;gap:6px;padding:0 20px 20px}
     #tsl-page .trade-card{display:block;width:100%;min-width:0;
       border:1px solid var(--line);border-radius:8px;background:var(--surface);overflow:hidden}
@@ -452,13 +456,17 @@
           <button class="button" type="button" data-days="30">30D</button>
           <button id="tsl-full" class="button" type="button">Full History</button>
         </div>
+        <span class="spacer"></span>
+        <button id="tsl-pull" class="button primary" type="button">Refresh View</button>
+      </div>
+      <div class="toolbar dates">
         <div class="toolbar-group">
+          <label>Custom dates</label>
           <label for="tsl-from">From</label><input id="tsl-from" type="date">
           <label for="tsl-to">To</label><input id="tsl-to" type="date">
+          <button id="tsl-pull-dates" class="button" type="button">Pull Dates</button>
           <button id="tsl-clear-dates" class="button" type="button">Clear Dates</button>
         </div>
-        <span class="spacer"></span>
-        <button id="tsl-pull" class="button primary" type="button">Pull Now</button>
       </div>
       <div class="toolbar secondary">
         <span class="spacer"></span>
@@ -509,7 +517,8 @@
     function setStatus(message) { status.textContent = message; }
     function setBusy(busy) {
       state.busy = busy;
-      page.querySelectorAll('#tsl-pull,#tsl-full,[data-days],#tsl-test').forEach(button => {
+      page.querySelectorAll('#tsl-pull,#tsl-pull-dates,#tsl-clear-dates,#tsl-from,#tsl-to,' +
+        '#tsl-full,[data-days],#tsl-test,#tsl-clear-cache').forEach(button => {
         button.disabled = busy;
       });
       progress.classList.toggle('running', busy);
@@ -530,10 +539,15 @@
       }
     }
     function updateRangeButtons() {
+      const mode = state.view?.mode ?? (fromInput.value && toInput.value ? null : 'days');
       page.querySelectorAll('[data-days]').forEach(button => {
-        button.classList.toggle('active',
-          !fromInput.value && !toInput.value && button.dataset.days === state.days);
+        button.classList.toggle('active', mode === 'days' && button.dataset.days === state.days);
       });
+      find('#tsl-full').classList.toggle('active', mode === 'full');
+      find('#tsl-pull-dates').classList.toggle('active', mode === 'dates');
+      find('#tsl-pull').textContent = mode === 'full' ? 'Refresh Full History' :
+        mode === 'dates' ? 'Refresh Dates' :
+          mode === 'days' ? 'Refresh ' + state.days + 'D' : 'Refresh View';
     }
     updateRangeButtons();
 
@@ -598,6 +612,17 @@
         amount.textContent = currency(value);
         if (special) amount.className = value >= 0 ? 'positive' : 'negative';
         card.append(caption, amount);
+        if (special) {
+          const roi = totals.buy > 0 ? totals.profit / totals.buy * 100 : null;
+          const percentage = document.createElement('span');
+          percentage.className = 'roi' + (roi == null ? '' : roi >= 0 ? ' positive' : ' negative');
+          percentage.textContent = 'ROI: ' + (roi == null ? '—' :
+            (roi > 0 ? '+' : '') + roi.toLocaleString(undefined, {
+              minimumFractionDigits: 2, maximumFractionDigits: 2
+            }) + '%');
+          percentage.title = 'Profit divided by the cost of shares sold in this date range and stock';
+          card.appendChild(percentage);
+        }
         summary.appendChild(card);
       }
       find('#tsl-count').textContent =
@@ -720,22 +745,25 @@
       }
     }
 
-    function selectedRange() {
+    function selectedRange(mode) {
+      if (mode !== 'dates') {
+        const to = now();
+        return { from: to - Number(state.days) * DAY, to,
+          label: 'last ' + state.days + ' days', fresh: true, mode: 'days' };
+      }
       const fromText = fromInput.value;
       const toText = toInput.value;
-      if (fromText || toText) {
-        if (!fromText || !toText) throw new Error('Choose both From and To dates.');
-        const from = dateBoundary(fromText);
-        const to = dateBoundary(toText, true);
-        if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
-            from <= 0 || from > to || to > now() + DAY) {
-          throw new Error('Choose a valid From and To date range.');
-        }
-        return { from, to: Math.min(to, now()), label: fromText + ' → ' + toText, fresh: false };
+      if (!fromText || !toText) throw new Error('Choose both From and To dates.');
+      const from = dateBoundary(fromText);
+      const to = dateBoundary(toText, true);
+      const current = now();
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
+          from <= 0 || from > to || from > current) {
+        throw new Error('Choose a valid date range starting no later than today.');
       }
-      const to = now();
-      return { from: to - Number(state.days) * DAY, to,
-        label: 'last ' + state.days + ' days', fresh: true };
+      return { from, to: Math.min(to, current),
+        label: fromText + ' → ' + toText + (to > current ? ' (through today)' : ''),
+        fresh: false, mode: 'dates' };
     }
 
     function currentKey() {
@@ -745,17 +773,31 @@
       return key;
     }
 
-    async function pull() {
+    async function pull(mode) {
       if (state.busy) return;
       try {
         const key = currentKey();
-        const view = selectedRange();
-        state.view = view;
+        const view = selectedRange(mode);
+        if (mode !== 'dates') {
+          state.view = view;
+          updateRangeButtons();
+        }
         setBusy(true);
         setProgress(null, null, 'Loading stock names…');
         state.stockMap = await stockMapFor(key, setStatus);
-        const result = await importRange(key, view.from, view.to, view.fresh,
-          progressReport => setProgress(null, null, progressReport.message));
+        let result;
+        if (mode === 'dates') {
+          setProgress(null, null, 'Checking earlier trades for accurate buy prices…');
+          const signup = await accountSignup(key, setStatus);
+          result = signup > view.to ? { requests: 0, added: 0 } :
+            await importRange(key, signup, view.to, false,
+              progressReport => setProgress(signup, view.to, progressReport.message));
+          state.view = view;
+          updateRangeButtons();
+        } else {
+          result = await importRange(key, view.from, view.to, view.fresh,
+            progressReport => setProgress(null, null, progressReport.message));
+        }
         render();
         setStatus(view.label + ': ' + result.added + ' new trades cached in ' +
           result.requests + ' API requests.');
@@ -775,7 +817,8 @@
         setProgress(null, null, 'Reading your account creation date…');
         const from = await accountSignup(key, setStatus);
         const to = now();
-        state.view = { from, to, label: 'Full History' };
+        state.view = { from, to, label: 'Full History', mode: 'full' };
+        updateRangeButtons();
         state.stockMap = await stockMapFor(key, setStatus);
         const result = await importRange(key, from, to, false,
           update => setProgress(from, to, update.message));
@@ -797,8 +840,7 @@
       input.addEventListener('change', () => {
         GM_setValue(KEY.from, fromInput.value);
         GM_setValue(KEY.to, toInput.value);
-        updateRangeButtons();
-        if (fromInput.value && toInput.value && keyInput.value.trim()) pull();
+        setStatus('Dates changed. Click Pull Dates to update trades and totals.');
       });
     }
     page.querySelectorAll('[data-days]').forEach(button => {
@@ -809,8 +851,12 @@
         toInput.value = '';
         GM_setValue(KEY.from, '');
         GM_setValue(KEY.to, '');
-        updateRangeButtons();
-        if (keyInput.value.trim()) pull();
+        if (keyInput.value.trim()) pull('days');
+        else {
+          state.view = selectedRange('days');
+          updateRangeButtons();
+          render();
+        }
       });
     });
     find('#tsl-clear-dates').addEventListener('click', () => {
@@ -818,10 +864,26 @@
       toInput.value = '';
       GM_setValue(KEY.from, '');
       GM_setValue(KEY.to, '');
-      updateRangeButtons();
-      setStatus('Custom dates cleared. Select 7D, 14D or 30D to load trades.');
+      if (state.view?.mode === 'dates') {
+        if (keyInput.value.trim()) pull('days');
+        else {
+          state.view = selectedRange('days');
+          updateRangeButtons();
+          render();
+          setStatus('Custom dates cleared. Showing cached ' + state.days + 'D trades.');
+        }
+      } else {
+        updateRangeButtons();
+        setStatus(state.view ? 'Custom dates cleared. Current view unchanged.' :
+          'Custom dates cleared. Choose 7D, 14D or 30D to load trades.');
+      }
     });
-    find('#tsl-pull').addEventListener('click', pull);
+    find('#tsl-pull-dates').addEventListener('click', () => pull('dates'));
+    find('#tsl-pull').addEventListener('click', () => {
+      const mode = state.view?.mode ?? (fromInput.value && toInput.value ? 'dates' : 'days');
+      if (mode === 'full') fullHistory();
+      else pull(mode);
+    });
     find('#tsl-full').addEventListener('click', fullHistory);
     action.addEventListener('change', render);
     find('#tsl-clear-filters').addEventListener('click', () => {
@@ -865,7 +927,25 @@
     // Show already cached trades without making an API request on page load.
     const cached = readObject(KEY.logs);
     if (Object.keys(cached).length) {
-      try { state.view = selectedRange(); render(); } catch { /* Wait for both dates. */ }
+      try {
+        const datesSelected = Boolean(fromInput.value && toInput.value);
+        const view = selectedRange(datesSelected ? 'dates' : 'days');
+        const signup = Number(GM_getValue(KEY.signup, 0));
+        if (!datesSelected || (Number.isSafeInteger(signup) && signup > 0 &&
+            (signup > view.to || !missingIntervals(signup, view.to).length))) {
+          state.view = view;
+          updateRangeButtons();
+          render();
+        } else {
+          find('#tsl-results .note').textContent =
+            'Click Pull Dates to verify earlier trades before showing totals.';
+          setStatus('Custom dates saved. Click Pull Dates to load accurate totals.');
+        }
+      } catch {
+        setStatus('Check both custom dates, then click Pull Dates.');
+      }
+    } else if (fromInput.value && toInput.value) {
+      setStatus('Custom dates saved. Click Pull Dates to load accurate totals.');
     }
     return page;
   }
