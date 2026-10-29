@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.0 — 2026-10-29
+
+### Safer API keys
+- **Custom keys supported.** You no longer need a Full Access key. Create a Custom key with only **user → log, profile** and **torn → stocks**. Full Access keys still work.
+- **Key sent in the request header, not the web address.** Calls now use Torn's `Authorization: ApiKey …` header, so the key no longer appears in request URLs. If Torn's older v1 stock-names endpoint rejects the header, that one call falls back to the v1 format automatically.
+- Calls are labelled **"StockLedger"** in your Torn API access log.
+
+### New
+- **ToS button** next to the key box opens the Terms of Service table (data storage, sharing, purpose, key storage and access level) without cluttering the page.
+- **TornPDA:** your PDA API key is filled in automatically when none is saved. It's only stored once you use it.
+
+### Changed
+- **Clear Cache** and **Clear Manual** now ask you to click again to confirm, instead of showing a browser pop-up.
+- Tooltips use the ledger's own style instead of Torn's, so they no longer get stuck on screen when the page updates.
+- Clearer messages for API errors 1, 8, 9, 14 and 24. Errors 8, 9 and 24 (IP block, API disabled or closed) pause all API calls for 10 minutes; error 14 (daily limit) pauses them until midnight TCT. The status line shows when calls resume.
+- Temporary Torn API errors (0, 15, 17) are retried, and rate-limit waits follow Torn's `Retry-After` time when it's given.
+
+### Fixes
+- **Gross (Sell)** showed $1 less than shares × price on some trades because of rounding. Fee, net proceeds, profit and all totals were already correct.
+
+### Data and API use
+All network requests still go to `api.torn.com` only. Your API key and trade cache stay in local script storage and are never shared.
+
 ## 1.1.0 — 2026-10-14
 
 ### Now on Torn PDA

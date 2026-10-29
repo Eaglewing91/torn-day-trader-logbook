@@ -1,7 +1,7 @@
 # Torn Stock Ledger
 
 **Stock trade history and profit tracking for Torn**  
-Version **1.0.0** · Created by **Eaglewing [571041]**
+Version **1.2.0** · Created by **Eaglewing [571041]**
 
 Torn Stock Ledger is the newly developed, fully working release of **Torn Day Trader Logbook (Experimental)**. It gives your stock trades a dedicated page within Torn, with a clear view of buying costs, selling fees and profit.
 
@@ -26,19 +26,23 @@ Torn Stock Ledger is the newly developed, fully working release of **Torn Day Tr
 
 ## Getting started
 
-1. Enter a **Full Access Torn API key** on the ledger page. You can use **Test Key** to check it.
+1. Enter a Torn API key on the ledger page: a **Custom key** with **user → log, profile** and **torn → stocks** (recommended), or a Full Access key. You can use **Test Key** to check it, and **ToS** to see how the key is used. On TornPDA your key is filled in for you.
 2. Choose **7D**, **14D**, **30D**, or both **From** and **To** dates. Choose **Full History** to retrieve all available account history with one click.
-3. Select a trade to see its full breakdown. Use **Pull Now** to refresh the selected range.
+3. Select a trade to see its full breakdown. Use **Refresh** to update the selected range.
 
 The first Full History import may take a minute or two. Its progress bar tracks the account dates checked. If an import stops, completed data remains cached and you can click **Full History** again to continue.
 
 ## Data and accuracy
 
-Your API key and trade cache are stored locally in Tampermonkey. The key is sent to Torn's API to request your data. Torn's rounding may cause small differences between displayed calculations and settled amounts. A sale with no known buy cost shows no calculated profit until you enter a manual buy price.
+Your API key and trade cache are stored locally in Tampermonkey (or TornPDA). The key is sent only to Torn's API, in the request header, to request your data. Torn's rounding may cause small differences between displayed calculations and settled amounts. A sale with no known buy cost shows no calculated profit until you enter a manual buy price.
 
 ## Updates
 
 The install link points to `torn-day-trader-logbook.user.js`, the existing filename in this repository. The script's update URLs point to the same file. Future releases can update installed copies when their script version is increased.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

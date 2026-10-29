@@ -1,31 +1,34 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.1.0
+// @version      1.2.0
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // @downloadURL  https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
-// @description  View your Torn stock trades, costs, fees and profit for 7/14/30 days, custom dates or your full account history. Uses only your own API data; your key and trades are stored locally and never shared. Requires a Full Access API key (user log).
+// @description  View your Torn stock trades, costs, fees and profit for 7/14/30 days, custom dates or your full account history. Uses only your own API data; your key and trades are stored locally and never shared. Requires a Custom key (user log + profile, torn stocks) or a Full Access key.
 // @match        https://www.torn.com/page.php?sid=stocks*
 // @run-at       document-idle
 // @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      api.torn.com
 // @license      MIT
 // ==/UserScript==
 
-// Terms of Service
+// Terms of Service (also shown in-page via the ToS button next to the key box)
 // | Data Storage            | Data Sharing | Purpose of Use                                   | Key Storage & Sharing                        | Key Access Level                                       |
 // |-------------------------|--------------|--------------------------------------------------|----------------------------------------------|--------------------------------------------------------|
-// | No / Only locally       | Nobody       | Non malicious statistical analysis (own stock    | Stored locally (Tampermonkey) / Not shared;  | Full (user log). Selections: user log, user profile,   |
-// | (Tampermonkey storage)  |              | trade costs, fees and profit)                    | used only for api.torn.com calls             | torn stocks                                            |
+// | Only locally            | Nobody       | Non malicious statistical analysis (own stock    | Stored locally (Tampermonkey) / Not shared;  | Custom - user: log, profile; torn: stocks              |
+// | (Tampermonkey storage)  |              | trade costs, fees and profit)                    | used only for api.torn.com calls             | (or Full Access)                                       |
 //
 // On the Stocks page a "Torn Stock Ledger" link is added to the header. On the
 // ledger URL the stock application is replaced with the ledger page.
-// Network use: only fetch() calls to api.torn.com. Nothing is requested from
-// torn.com pages and no data is sent anywhere else.
+// Network use: only calls to api.torn.com, with the key sent in the
+// Authorization header. Nothing is requested from torn.com pages and no data
+// is sent anywhere else.
 (function () {
   'use strict';
 
@@ -58,8 +61,15 @@
     signup: 'torn_stock_ledger_signup_v1',
     stockMapTs: 'torn_stock_ledger_stock_map_ts_v1',
     lock: 'torn_stock_ledger_import_lock_v1',
-    compacted: 'torn_stock_ledger_compacted_v1'
+    compacted: 'torn_stock_ledger_compacted_v1',
+    pause: 'torn_stock_ledger_api_pause_v1',
+    v1Query: 'torn_stock_ledger_v1_query_key_v1'
   });
+  const API_COMMENT = 'StockLedger';
+  // TornPDA swaps this placeholder for the user's key. It is split so PDA's
+  // substitution never rewrites the comparison itself.
+  const PDA_KEY = '###PDA-APIKEY###';
+  const PDA_PLACEHOLDER = '###' + 'PDA-APIKEY' + '###';
 
   let activeAbort = null;
   let lockHeld = false;
@@ -182,20 +192,91 @@
   }
 
   // ---------- API ----------
+  const KEY_HELP = 'Use a Custom key with user → log and profile and torn → stocks, or a Full Access key.';
   const API_ERRORS = {
+    1: 'No API key reached Torn. Enter your key and try again.',
     2: 'Incorrect API key. Check the key and try again.',
+    8: 'Torn has temporarily blocked API requests from your IP address.',
+    9: 'Torn\'s API is temporarily disabled.',
     10: 'This key\'s owner is in federal jail, so the key cannot be used.',
     13: 'This key is disabled because its owner has been inactive.',
-    16: 'This key\'s access level is too low. Torn Stock Ledger needs a Full Access key to read your stock logs.',
-    18: 'This key is paused. Unpause it in your Torn API settings.'
+    14: 'This key has reached its daily read limit.',
+    16: 'This key\'s access level is too low to read your stock log. ' + KEY_HELP,
+    18: 'This key is paused. Unpause it in your Torn API settings.',
+    24: 'Torn\'s API is temporarily closed.'
   };
+  // Errors that pause every API call (in all tabs) until the given time.
+  const PAUSE_FOR = {
+    8: () => Date.now() + 600000,
+    9: () => Date.now() + 600000,
+    24: () => Date.now() + 600000,
+    14: () => { const d = new Date(); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1); }
+  };
+  const TEMPORARY = new Set([0, 15, 17]); // unknown / temporary / backend errors: retry
+
+  class ApiError extends Error {
+    constructor(code, message) {
+      super(message);
+      this.name = 'ApiError';
+      this.code = code;
+    }
+  }
+
+  function pauseMessage() {
+    const pause = GM_getValue(KEY.pause, null);
+    if (!pause || !(Number(pause.until) > Date.now())) return null;
+    return (pause.reason || 'API calls are paused.') + ' The ledger will not call the API again until ' +
+      new Date(Number(pause.until)).toLocaleTimeString(undefined, { timeZone: 'UTC', hour: '2-digit', minute: '2-digit' }) +
+      ' TCT.';
+  }
+
+  // One GET request. Tampermonkey's GM_xmlhttpRequest first (no CORS limits
+  // on the Authorization header), then TornPDA's handler, then fetch.
+  function httpGet(url, headers) {
+    const signal = activeAbort?.signal;
+    if (signal?.aborted) return Promise.reject(new Cancelled());
+    const headerOf = (raw) => (name) => {
+      const match = String(raw || '').match(new RegExp('^' + name + ':\\s*(.*)$', 'im'));
+      return match ? match[1].trim() : null;
+    };
+    if (typeof GM_xmlhttpRequest === 'function') {
+      return new Promise((resolve, reject) => {
+        let request = null;
+        const onAbort = () => { try { request?.abort(); } catch {} reject(new Cancelled()); };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        const done = (fn) => (value) => { signal?.removeEventListener('abort', onAbort); fn(value); };
+        request = GM_xmlhttpRequest({
+          method: 'GET', url, headers, timeout: 30000, anonymous: true,
+          onload: done(r => resolve({ status: r.status, text: r.responseText, header: headerOf(r.responseHeaders) })),
+          onerror: done(() => reject(new Error('Network error'))),
+          ontimeout: done(() => reject(new Error('Request timed out')))
+        });
+      });
+    }
+    if (typeof window.PDA_httpGet === 'function') {
+      return Promise.resolve(window.PDA_httpGet(url, headers)).then(r => {
+        if (signal?.aborted) throw new Cancelled();
+        return { status: Number(r?.status) || 200, text: r?.responseText ?? '', header: headerOf(r?.responseHeaders) };
+      });
+    }
+    return fetch(url, { headers, cache: 'no-store', signal }).then(async r => ({
+      status: r.status, text: await r.text(), header: (name) => r.headers.get(name)
+    }));
+  }
 
   const attempts = [];
-  async function apiJSON(path, params, report = () => {}) {
+  // The key travels in the Authorization header. keyInQuery is only used if
+  // Torn's v1 endpoint rejects the header (see stockMapFor).
+  async function apiJSON(path, params, report = () => {}, { key, keyInQuery = false } = {}) {
     const url = new URL(path, API);
-    url.search = new URLSearchParams(params).toString();
+    const query = new URLSearchParams({ ...params, comment: API_COMMENT });
+    if (keyInQuery) query.set('key', key);
+    url.search = query.toString();
+    const headers = keyInQuery ? {} : { Authorization: 'ApiKey ' + key };
     for (let retry = 0; retry < 4; retry++) {
       if (activeAbort?.signal.aborted) throw new Cancelled();
+      const paused = pauseMessage();
+      if (paused) throw new Error(paused);
       const current = Date.now();
       while (attempts.length && current - attempts[0] >= 60000) attempts.shift();
       if (attempts.length >= 45) {
@@ -209,26 +290,40 @@
       let response;
       let data;
       try {
-        response = await fetch(url.href, { cache: 'no-store', signal: activeAbort?.signal });
-        data = await response.json();
+        response = await httpGet(url.href, headers);
+        data = JSON.parse(response.text);
       } catch (error) {
-        if (activeAbort?.signal.aborted) throw new Cancelled();
-        if (retry === 3) throw error;
+        if (error instanceof Cancelled || activeAbort?.signal.aborted) throw new Cancelled();
+        if (retry === 3) throw new Error('Could not reach the Torn API (' + (error.message || error) + ').');
         report('Connection interrupted; retrying…');
         await wait(2000 * (retry + 1));
         continue;
       }
-      if (response.status === 429 || response.status === 503 || data?.error?.code === 5) {
+      const code = data?.error ? Number(data.error.code) : null;
+      if (response.status === 429 || response.status === 503 || code === 5) {
         if (retry === 3) throw new Error('Torn is still rate limiting requests. Try again to continue.');
-        report('Torn is rate limiting requests; waiting 65s…');
-        await wait(65000);
+        const after = Number(response.header('Retry-After'));
+        const delay = Number.isFinite(after) && after > 0 ? Math.min(after, 300) * 1000 + 1000 : 65000;
+        report('Torn is rate limiting requests; waiting ' + Math.round(delay / 1000) + 's…');
+        await wait(delay);
         continue;
       }
-      if (data?.error) {
-        throw new Error(API_ERRORS[data.error.code] ||
-          'API error ' + data.error.code + ': ' + data.error.error);
+      if (code != null && TEMPORARY.has(code) && retry < 3) {
+        report('Torn API error ' + code + '; retrying…');
+        await wait(5000 * (retry + 1));
+        continue;
       }
-      if (!response.ok || !data) throw new Error('Unexpected API response (HTTP ' + response.status + ').');
+      if (code != null) {
+        const message = API_ERRORS[code] || 'API error ' + code + ': ' + data.error.error;
+        if (PAUSE_FOR[code]) {
+          GM_setValue(KEY.pause, { until: PAUSE_FOR[code](), reason: message });
+          throw new ApiError(code, pauseMessage() || message);
+        }
+        throw new ApiError(code, message);
+      }
+      if (response.status < 200 || response.status >= 300 || !data) {
+        throw new Error('Unexpected API response (HTTP ' + response.status + ').');
+      }
       return data;
     }
     throw new Error('Could not reach the Torn API.');
@@ -244,7 +339,18 @@
     const fresh = Date.now() - Number(GM_getValue(KEY.stockMapTs, 0)) < STOCK_MAP_TTL;
     if (Object.keys(saved).length && (!unknown || fresh)) return saved;
     try {
-      const data = await apiJSON('/torn/', { selections: 'stocks', key }, report);
+      // /torn/?selections=stocks is a v1 endpoint. The key goes in the header;
+      // if Torn's v1 rejects that (error 1/2 after the log calls succeeded with
+      // the same key), fall back to the v1 query-string form and remember it.
+      const keyInQuery = Boolean(GM_getValue(KEY.v1Query, false));
+      let data;
+      try {
+        data = await apiJSON('/torn/', { selections: 'stocks' }, report, { key, keyInQuery });
+      } catch (error) {
+        if (keyInQuery || !(error instanceof ApiError) || (error.code !== 1 && error.code !== 2)) throw error;
+        data = await apiJSON('/torn/', { selections: 'stocks' }, report, { key, keyInQuery: true });
+        GM_setValue(KEY.v1Query, true);
+      }
       const map = { ...saved };
       for (const [id, stock] of Object.entries(data.stocks || {})) {
         map[id] = { acronym: stock.acronym || stock.name || id, name: stock.name || id };
@@ -261,7 +367,7 @@
   async function accountSignup(key, report) {
     const saved = Number(GM_getValue(KEY.signup, 0));
     if (Number.isSafeInteger(saved) && saved > 0 && saved <= now()) return saved;
-    const data = await apiJSON('/v2/user/profile', { key }, report);
+    const data = await apiJSON('/v2/user/profile', {}, report, { key });
     const signup = Number(data.profile?.signed_up);
     if (!Number.isSafeInteger(signup) || signup <= 0 || signup > now()) {
       throw new Error('Could not read your account creation date.');
@@ -329,8 +435,8 @@
         report({ percent: percent(), message: 'Checking ' + new Date(first * 1000).toLocaleDateString() +
           ' – ' + new Date(last * 1000).toLocaleDateString() + '…' });
         const data = await apiJSON('/v2/user/log', {
-          log: STOCK_BUY + ',' + STOCK_SELL, limit: PAGE_LIMIT, from: first, to: last, key
-        }, message => report({ percent: percent(), message }));
+          log: STOCK_BUY + ',' + STOCK_SELL, limit: PAGE_LIMIT, from: first, to: last
+        }, message => report({ percent: percent(), message }), { key });
         if (!Array.isArray(data.log) || !data._metadata?.links || !('next' in data._metadata.links)) {
           throw new Error('The stock log API response was incomplete. Progress was saved.');
         }
@@ -429,7 +535,7 @@
       }
       rows.push({
         ...event, buyPrice: cost == null ? null : cost / event.shares, sellPrice: event.price,
-        gross: net + fee, fee, cost, net, profit: cost == null ? null : net - cost,
+        gross, fee, cost, net, profit: cost == null ? null : net - cost,
         manual: manualUsed, editable: untracked > 0,
         tracked, untracked, trackedAvg: tracked > 0 ? trackedAvg : null
       });
@@ -551,11 +657,27 @@
     #tsl-page .footer{display:flex;flex-wrap:wrap;justify-content:space-between;gap:14px;align-items:center;
       padding:12px 20px;border-top:1px solid var(--line);background:#1b1316;color:var(--muted)}
     #tsl-page #tsl-status{overflow-wrap:anywhere}
+    #tsl-page .tos{margin:0;padding:12px 20px 14px;background:#140f11;border-bottom:1px solid var(--line)}
+    #tsl-page .tos-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+    #tsl-page .tos-head h3{margin:0}
+    #tsl-page .tos-table{display:grid;gap:1px;border:1px solid var(--line);border-radius:8px;overflow:hidden;
+      background:var(--line)}
+    #tsl-page .tos-table>div{display:grid;grid-template-columns:minmax(120px,190px) 1fr;background:var(--surface)}
+    #tsl-page .tos-table b,#tsl-page .tos-table span{padding:7px 10px;font-size:12px}
+    #tsl-page .tos-table b{color:var(--muted);background:#1f1619}
+    #tsl-page .tos-note{margin:8px 0 0;color:var(--muted);font-size:11px}
+    #tsl-page .tos-note a{color:#ff8790!important}
+    #tsl-page .button.armed{background:#7a1f2a!important;border-color:#ff8a96!important;color:#fff!important}
+    #tsl-page .tip{position:fixed;z-index:999999;max-width:260px;padding:6px 9px;border-radius:6px;
+      border:1px solid #8a3442;background:#120c0e;color:#f6eef0;font-size:11px;line-height:1.35;
+      pointer-events:none;box-shadow:0 6px 18px #0008}
+    @media(max-width:520px){#tsl-page .tos-table>div{grid-template-columns:1fr}}
     @media(max-width:850px){
       #tsl-page .header,#tsl-page .toolbar,#tsl-page .filterbar{padding-left:12px;padding-right:12px}
       #tsl-page .tabs{padding-left:12px}
       #tsl-page .summary,#tsl-page .positions,#tsl-page .trades{padding-left:12px;padding-right:12px}
       #tsl-page .missing{margin-left:12px;margin-right:12px}
+      #tsl-page .tos{padding-left:12px;padding-right:12px}
     }
   `);
 
@@ -593,14 +715,30 @@
       <div class="toolbar secondary">
         <span class="spacer"></span>
         <div class="toolbar-group">
-          <label for="tsl-key">Full Access API key</label>
+          <label for="tsl-key">API key (Custom or Full)</label>
           <input id="tsl-key" type="password" autocomplete="off" placeholder="Stored in Tampermonkey">
           <button id="tsl-test" class="button" type="button">Test Key</button>
+          <button id="tsl-tos-toggle" class="button" type="button" aria-expanded="false"
+            aria-controls="tsl-tos" data-tip="How your API key and data are used">ToS</button>
         </div>
         <div class="toolbar-group">
           <button id="tsl-clear-manual" class="button" type="button">Clear Manual</button>
           <button id="tsl-clear-cache" class="button" type="button">Clear Cache</button>
         </div>
+      </div>
+      <div id="tsl-tos" class="tos" hidden>
+        <div class="tos-head"><h3>Terms of Service</h3>
+          <button id="tsl-tos-close" class="button" type="button" aria-label="Close Terms of Service">Close</button></div>
+        <div class="tos-table" role="table" aria-label="Torn Stock Ledger Terms of Service">
+          <div role="row"><b role="rowheader">Data Storage</b><span role="cell">Only locally (Tampermonkey / TornPDA storage on your device)</span></div>
+          <div role="row"><b role="rowheader">Data Sharing</b><span role="cell">Nobody</span></div>
+          <div role="row"><b role="rowheader">Purpose of Use</b><span role="cell">Non malicious statistical analysis of your own stock trades (costs, fees and profit)</span></div>
+          <div role="row"><b role="rowheader">Key Storage &amp; Sharing</b><span role="cell">Stored locally / Not shared. Used only for calls to api.torn.com, sent in the Authorization header</span></div>
+          <div role="row"><b role="rowheader">Key Access Level</b><span role="cell">Custom: user → log, profile; torn → stocks. A Full Access key also works</span></div>
+        </div>
+        <p class="tos-note">The key and your trade cache never leave your device except in requests to Torn's own API.
+          Calls are labelled "StockLedger" in your Torn API access log. Clear the key field to delete the stored key.
+          <a href="https://www.torn.com/api.html" target="_blank" rel="noopener">Torn API</a></p>
       </div>
       <div class="progress" id="tsl-progress" role="progressbar"
         aria-label="History dates checked" aria-valuemin="0" aria-valuemax="100"><span></span></div>
@@ -610,7 +748,7 @@
           <option value="BUY">Buys only</option><option value="SELL">Sells only</option>
           <option value="MISSING">Sells missing buy price</option></select>
         <button id="tsl-clear-filters" class="button" type="button">Clear Filters</button>
-        <button id="tsl-export" class="button" type="button" title="Download the trades matching the current view and filters">Export CSV</button>
+        <button id="tsl-export" class="button" type="button" data-tip="Download the trades matching the current view and filters">Export CSV</button>
         <span class="spacer"></span><span id="tsl-count">No trades loaded</span>
       </div>
       <div id="tsl-tabs" class="tabs"></div>
@@ -624,6 +762,61 @@
         <span>Made by Eaglewing [571041]</span></div>`;
 
     const find = (selector) => page.querySelector(selector);
+
+    // Own tooltip for [data-tip]: Torn turns title attributes into its own
+    // pop-ups, which get stuck when the element is re-rendered under the cursor.
+    const tip = document.createElement('div');
+    tip.className = 'tip';
+    tip.hidden = true;
+    tip.setAttribute('role', 'tooltip');
+    let tipTarget = null;
+    function hideTip() { tip.hidden = true; tipTarget = null; }
+    function showTip(target) {
+      tipTarget = target;
+      tip.textContent = target.dataset.tip;
+      tip.hidden = false;
+      const box = target.getBoundingClientRect();
+      const width = tip.offsetWidth;
+      const height = tip.offsetHeight;
+      const left = Math.max(6, Math.min(window.innerWidth - width - 6, box.left + box.width / 2 - width / 2));
+      const top = box.top - height - 8 >= 6 ? box.top - height - 8 : box.bottom + 8;
+      tip.style.left = left + 'px';
+      tip.style.top = top + 'px';
+    }
+    page.addEventListener('mouseover', event => {
+      const target = event.target.closest?.('[data-tip]');
+      if (target && target !== tipTarget && page.contains(target)) showTip(target);
+      else if (!target) hideTip();
+    });
+    page.addEventListener('mouseleave', hideTip);
+    page.addEventListener('focusin', event => {
+      const target = event.target.closest?.('[data-tip]');
+      if (target) showTip(target);
+    });
+    page.addEventListener('focusout', hideTip);
+    page.addEventListener('click', hideTip);
+    window.addEventListener('scroll', hideTip, { passive: true });
+
+    // Inline "click again to confirm" instead of a blocking confirm() pop-up.
+    function confirmClick(button, label, action) {
+      const original = button.textContent;
+      let timer = null;
+      button.addEventListener('click', () => {
+        if (!button.classList.contains('armed')) {
+          button.classList.add('armed');
+          button.textContent = label;
+          timer = setTimeout(() => {
+            button.classList.remove('armed');
+            button.textContent = original;
+          }, 4000);
+          return;
+        }
+        clearTimeout(timer);
+        button.classList.remove('armed');
+        button.textContent = original;
+        action();
+      });
+    }
     const keyInput = find('#tsl-key');
     const fromInput = find('#tsl-from');
     const toInput = find('#tsl-to');
@@ -637,6 +830,10 @@
       stockMap: readObject(KEY.stockMap), view: null, busy: false, shown: []
     };
     keyInput.value = String(GM_getValue(KEY.api, ''));
+    // On TornPDA, offer the app's own key when none is saved yet. It is only
+    // stored once the user uses it (Refresh, Pull or Test Key).
+    const pdaKey = PDA_KEY !== PDA_PLACEHOLDER && /^[A-Za-z0-9]{16}$/.test(PDA_KEY) ? PDA_KEY : '';
+    if (!keyInput.value && pdaKey) keyInput.value = pdaKey;
     fromInput.value = String(GM_getValue(KEY.from, ''));
     toInput.value = String(GM_getValue(KEY.to, ''));
 
@@ -695,7 +892,10 @@
       button.type = 'button';
       button.className = 'edit';
       button.textContent = text;
-      if (title) button.title = title;
+      if (title) {
+        button.dataset.tip = title;
+        button.setAttribute('aria-label', title);
+      }
       button.addEventListener('click', onClick);
       return button;
     }
@@ -714,7 +914,6 @@
       const main = document.createElement('button');
       main.type = 'button';
       main.className = 'trade-main';
-      main.title = 'Show trade details';
       main.setAttribute('aria-expanded', 'false');
       const details = document.createElement('div');
       details.className = 'trade-details';
@@ -726,14 +925,12 @@
           results.querySelectorAll('.trade-main[aria-expanded="true"]').forEach(other => {
             if (other === main) return;
             other.setAttribute('aria-expanded', 'false');
-            other.title = 'Show trade details';
             other.nextElementSibling.hidden = true;
             other.parentElement.classList.remove('selected');
           });
         }
         const open = main.getAttribute('aria-expanded') !== 'true';
         main.setAttribute('aria-expanded', String(open));
-        main.title = open ? 'Hide trade details' : 'Show trade details';
         details.hidden = !open;
         row.classList.toggle('selected', open);
       });
@@ -761,7 +958,8 @@
           input.step = '0.01';
           input.className = 'edit-input';
           input.value = manualPrice;
-          input.title = 'Buy price per share for the ' + quantity(entry.untracked) + ' untracked shares';
+          input.setAttribute('aria-label', 'Buy price per share for the ' + quantity(entry.untracked) + ' untracked shares');
+          input.dataset.tip = input.getAttribute('aria-label');
           const commit = () => {
             const price = Number(input.value);
             if (!Number.isFinite(price) || price <= 0) {
@@ -813,6 +1011,7 @@
     }
 
     function render() {
+      hideTip();
       const view = state.view;
       if (!view) return;
       const logs = Object.values(readObject(KEY.logs)).filter(log => Number(log?.timestamp) <= view.to);
@@ -863,7 +1062,7 @@
       ]) {
         const card = document.createElement('div');
         card.className = 'card' + (special ? ' profit' : '');
-        card.title = title;
+        card.dataset.tip = title;
         const caption = document.createElement('small');
         caption.textContent = label;
         const amount = document.createElement('strong');
@@ -998,7 +1197,7 @@
 
     function currentKey() {
       const key = keyInput.value.trim();
-      if (!key) throw new Error('Enter a Full Access API key first.');
+      if (!key) throw new Error('Enter an API key first. ' + KEY_HELP);
       GM_setValue(KEY.api, key);
       return key;
     }
@@ -1122,7 +1321,7 @@
         const key = currentKey();
         setBusy(true);
         setStatus('Checking your API key…');
-        await apiJSON('/v2/user/log', { log: STOCK_BUY + ',' + STOCK_SELL, limit: 1, key }, setStatus);
+        await apiJSON('/v2/user/log', { log: STOCK_BUY + ',' + STOCK_SELL, limit: 1 }, setStatus, { key });
         setStatus('API key works and can read your stock logs.');
       } catch (error) {
         setStatus('API key test: ' + (error.message || String(error)));
@@ -1130,19 +1329,28 @@
         setBusy(false);
       }
     });
-    find('#tsl-clear-manual').addEventListener('click', () => {
-      if (!confirm('Clear all manually entered buy prices?')) return;
+    confirmClick(find('#tsl-clear-manual'), 'Click again to clear', () => {
       GM_setValue(KEY.manual, {});
       render();
       setStatus('Manual buy prices cleared.');
     });
-    find('#tsl-clear-cache').addEventListener('click', () => {
-      if (!confirm('Clear all cached stock trades and verified history dates? You will need to import them again.')) return;
+    find('#tsl-clear-manual').dataset.tip = 'Delete every manually entered buy price';
+    confirmClick(find('#tsl-clear-cache'), 'Click again to clear', () => {
       GM_setValue(KEY.logs, {});
       GM_setValue(KEY.coverage, []);
       render();
-      setStatus('Cached trade history cleared.');
+      setStatus('Cached trade history cleared. Refresh to import it again.');
     });
+    find('#tsl-clear-cache').dataset.tip = 'Delete all cached trades; you will need to import them again';
+    const tos = find('#tsl-tos');
+    const tosToggle = find('#tsl-tos-toggle');
+    const setTos = (open) => {
+      tos.hidden = !open;
+      tosToggle.setAttribute('aria-expanded', String(open));
+      tosToggle.classList.toggle('active', open);
+    };
+    tosToggle.addEventListener('click', () => setTos(tos.hidden));
+    find('#tsl-tos-close').addEventListener('click', () => setTos(false));
     find('.back').addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
@@ -1168,6 +1376,10 @@
     } else if (fromInput.value && toInput.value) {
       setStatus('Custom dates saved. Click Pull Dates to load accurate totals.');
     }
+    if (!GM_getValue(KEY.api, '') && keyInput.value) {
+      setStatus('Your TornPDA API key was filled in. Open ToS to see how it is used, then choose a range.');
+    }
+    page.appendChild(tip);
     return page;
   }
 
