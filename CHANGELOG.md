@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.1 — 2026-11-01
+
+### Changed
+- Terms of Service wording only: the Key Storage row and the header notes now say that if Torn's older v1 stock-names call rejects the header, that one call sends the key in the address instead (still only to api.torn.com).
+
 ## 1.2.0 — 2026-10-29
 
 ### Safer API keys

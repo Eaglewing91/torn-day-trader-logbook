@@ -1,7 +1,7 @@
 # Torn Stock Ledger
 
 **Stock trade history and profit tracking for Torn**  
-Version **1.2.0** · Created by **Eaglewing [571041]**
+Version **1.2.1** · Created by **Eaglewing [571041]**
 
 Torn Stock Ledger is the newly developed, fully working release of **Torn Day Trader Logbook (Experimental)**. It gives your stock trades a dedicated page within Torn, with a clear view of buying costs, selling fees and profit.
 
@@ -34,7 +34,7 @@ The first Full History import may take a minute or two. Its progress bar tracks 
 
 ## Data and accuracy
 
-Your API key and trade cache are stored locally in Tampermonkey (or TornPDA). The key is sent only to Torn's API, in the request header, to request your data. Torn's rounding may cause small differences between displayed calculations and settled amounts. A sale with no known buy cost shows no calculated profit until you enter a manual buy price.
+Your API key and trade cache are stored locally in Tampermonkey (or TornPDA). The key is sent only to Torn's API, in the request header, to request your data. If Torn's older v1 stock-names call rejects the header, that one call sends the key in the address instead (still only to api.torn.com). Torn's rounding may cause small differences between displayed calculations and settled amounts. A sale with no known buy cost shows no calculated profit until you enter a manual buy price.
 
 ## Updates
 

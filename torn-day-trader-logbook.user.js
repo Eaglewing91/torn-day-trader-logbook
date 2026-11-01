@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.2.0
+// @version      1.2.1
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -27,7 +27,8 @@
 // On the Stocks page a "Torn Stock Ledger" link is added to the header. On the
 // ledger URL the stock application is replaced with the ledger page.
 // Network use: only calls to api.torn.com, with the key sent in the
-// Authorization header. Nothing is requested from torn.com pages and no data
+// Authorization header. If Torn's older v1 stock-names call rejects the header,
+// that one call sends the key in the address instead (still only to api.torn.com). Nothing is requested from torn.com pages and no data
 // is sent anywhere else.
 (function () {
   'use strict';
@@ -733,7 +734,7 @@
           <div role="row"><b role="rowheader">Data Storage</b><span role="cell">Only locally (Tampermonkey / TornPDA storage on your device)</span></div>
           <div role="row"><b role="rowheader">Data Sharing</b><span role="cell">Nobody</span></div>
           <div role="row"><b role="rowheader">Purpose of Use</b><span role="cell">Non malicious statistical analysis of your own stock trades (costs, fees and profit)</span></div>
-          <div role="row"><b role="rowheader">Key Storage &amp; Sharing</b><span role="cell">Stored locally / Not shared. Used only for calls to api.torn.com, sent in the Authorization header</span></div>
+          <div role="row"><b role="rowheader">Key Storage &amp; Sharing</b><span role="cell">Stored locally / Not shared. Used only for calls to api.torn.com, sent in the Authorization header (if Torn's older stock-names call rejects the header, that one call sends it in the address instead)</span></div>
           <div role="row"><b role="rowheader">Key Access Level</b><span role="cell">Custom: user → log, profile; torn → stocks. A Full Access key also works</span></div>
         </div>
         <p class="tos-note">The key and your trade cache never leave your device except in requests to Torn's own API.
