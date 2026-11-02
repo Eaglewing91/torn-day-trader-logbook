@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.2.3
+// @version      1.3.0
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -725,6 +725,11 @@
             aria-controls="tsl-tos" data-tip="How your API key and data are used">ToS</button>
         </div>
         <div class="toolbar-group">
+          <button id="tsl-backup" class="button" type="button"
+            data-tip="Download your imported trades as a file (never includes your API key)">Backup</button>
+          <button id="tsl-restore" class="button" type="button"
+            data-tip="Load a backup file from the script or the website; trades are merged with what is here">Restore</button>
+          <input id="tsl-restore-file" type="file" accept=".json,application/json" hidden>
           <button id="tsl-clear-manual" class="button" type="button">Clear Manual</button>
           <button id="tsl-clear-cache" class="button" type="button">Clear Cache</button>
         </div>
@@ -741,6 +746,7 @@
         </div>
         <p class="tos-note">The key and your trade cache never leave your device except in requests to Torn's own API.
           Calls are labelled "StockLedger" in your Torn API access log. Clear the key field to delete the stored key.
+          Backup saves a file to your device only, and never includes your key.
           <a href="https://www.torn.com/api.html" target="_blank" rel="noopener">Torn API</a></p>
       </div>
       <div class="progress" id="tsl-progress" role="progressbar"
@@ -844,7 +850,7 @@
     function setBusy(busy) {
       state.busy = busy;
       page.querySelectorAll('#tsl-pull,#tsl-pull-dates,#tsl-clear-dates,#tsl-from,#tsl-to,' +
-        '#tsl-full,[data-days],#tsl-test,#tsl-clear-cache').forEach(button => {
+        '#tsl-full,[data-days],#tsl-test,#tsl-clear-cache,#tsl-restore').forEach(button => {
         button.disabled = busy;
       });
       find('#tsl-cancel').hidden = !busy;
@@ -1361,6 +1367,136 @@
       setStatus('Cached trade history cleared. Refresh to import it again.');
     });
     find('#tsl-clear-cache').dataset.tip = 'Delete all cached trades; you will need to import them again';
+
+    // ---------- Backup / restore ----------
+    // Moves imported history between the userscript and the website (or another
+    // device). The file holds trades, checked dates, manual buy prices and stock
+    // names. It never contains the API key, and nothing is uploaded anywhere.
+    const BACKUP_APP = 'torn-stock-ledger';
+    const SAFE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+    const plain = (value) => typeof value === 'number' || typeof value === 'string' ? value : undefined;
+
+    function downloadFile(name, text, type) {
+      const url = URL.createObjectURL(new Blob([text], { type }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function backup() {
+      const logs = Object.values(readObject(KEY.logs));
+      if (!logs.length) {
+        setStatus('Nothing to back up yet. Import some trades first.');
+        return;
+      }
+      const data = {
+        app: BACKUP_APP, format: 1, exported: now(),
+        signup: Number(GM_getValue(KEY.signup, 0)) || null,
+        coverage: coverage(), logs,
+        manual: readObject(KEY.manual), stockMap: readObject(KEY.stockMap)
+      };
+      downloadFile('torn-stock-ledger-backup-' + stamp(now()).slice(0, 10) + '.json',
+        JSON.stringify(data), 'application/json');
+      setStatus('Backed up ' + quantity(logs.length) + ' trades. The file does not include your API key.');
+    }
+
+    async function restore(file) {
+      if (!file) return;
+      if (state.busy) {
+        setStatus('Wait for the current import to finish, then restore.');
+        return;
+      }
+      let data;
+      try {
+        if (file.size > 50 * 1024 * 1024) throw new Error('that file is too large to be a ledger backup.');
+        data = JSON.parse(await file.text());
+      } catch (error) {
+        setStatus('Restore failed: ' + (error instanceof SyntaxError ? 'the file is not valid JSON.' : error.message));
+        return;
+      }
+      if (!data || data.app !== BACKUP_APP || data.format !== 1 || !Array.isArray(data.logs)) {
+        setStatus('Restore failed: this is not a Torn Stock Ledger backup file.');
+        return;
+      }
+      if (!acquireLock()) {
+        setStatus('An import is running in another tab. Let it finish, then restore.');
+        return;
+      }
+      try {
+        const exported = Number(data.exported);
+        const cache = readObject(KEY.logs);
+        let added = 0;
+        let skipped = 0;
+        for (const raw of data.logs) {
+          const id = raw?.id == null ? '' : String(raw.id);
+          const timestamp = Number(raw?.timestamp);
+          const type = Number(raw?.log);
+          const d = raw?.data;
+          if (!SAFE_ID.test(id) || id === '__proto__' || !Number.isSafeInteger(timestamp) || timestamp <= 0 ||
+              (type !== STOCK_BUY && type !== STOCK_SELL) || !d || typeof d !== 'object') {
+            skipped++;
+            continue;
+          }
+          if (!cache[id]) added++;
+          cache[id] = compactTrade({ id, timestamp, log: type,
+            data: { stock: plain(d.stock), amount: plain(d.amount), price: plain(d.price), worth: plain(d.worth) } });
+        }
+        // Checked dates only count up to when the backup was made.
+        const limit = Math.min(now(), Number.isSafeInteger(exported) ? exported : 0);
+        const restoredCoverage = (Array.isArray(data.coverage) ? data.coverage : [])
+          .map(pair => [Number(pair?.[0]), Math.min(Number(pair?.[1]), limit)]);
+        const manual = readObject(KEY.manual);
+        let manualAdded = 0;
+        for (const [id, entry] of Object.entries(data.manual && typeof data.manual === 'object' ? data.manual : {})) {
+          const price = Number(entry?.buyPrice);
+          if (!SAFE_ID.test(id) || id === '__proto__' || manual[id] || !Number.isFinite(price) || price <= 0) continue;
+          manual[id] = { buyPrice: price, ts: Number(entry?.ts) || now() };
+          manualAdded++;
+        }
+        const stockMap = readObject(KEY.stockMap);
+        for (const [id, stock] of Object.entries(data.stockMap && typeof data.stockMap === 'object' ? data.stockMap : {})) {
+          const acronym = typeof stock === 'string' ? stock : stock?.acronym;
+          const name = typeof stock === 'string' ? stock : stock?.name;
+          if (!/^\d{1,6}$/.test(id) || typeof acronym !== 'string' || !acronym || acronym.length > 12) continue;
+          if (!stockMap[id]) stockMap[id] = { acronym, name: typeof name === 'string' ? name.slice(0, 80) : acronym };
+        }
+        const signup = Number(data.signup);
+        if (!Number(GM_getValue(KEY.signup, 0)) && Number.isSafeInteger(signup) && signup > 0 && signup <= now()) {
+          GM_setValue(KEY.signup, signup);
+        }
+        GM_setValue(KEY.logs, cache);
+        GM_setValue(KEY.coverage, normalizeCoverage([...coverage(), ...restoredCoverage]));
+        GM_setValue(KEY.manual, manual);
+        GM_setValue(KEY.stockMap, stockMap);
+        state.stockMap = stockMap;
+        if (!state.view) {
+          state.view = selectedRange(fromInput.value && toInput.value ? 'dates' : 'days');
+          updateRangeButtons();
+        }
+        render();
+        setStatus('Restored ' + quantity(added) + ' new trades' +
+          (manualAdded ? ' and ' + quantity(manualAdded) + ' manual buy prices' : '') +
+          (skipped ? ' (' + quantity(skipped) + ' unreadable entries skipped)' : '') +
+          '. Press Refresh to fetch anything newer.');
+      } catch (error) {
+        setStatus('Restore failed: ' + (error.message || String(error)));
+      } finally {
+        releaseLock();
+      }
+    }
+
+    const restoreInput = find('#tsl-restore-file');
+    find('#tsl-backup').addEventListener('click', backup);
+    find('#tsl-restore').addEventListener('click', () => restoreInput.click());
+    restoreInput.addEventListener('change', () => {
+      const file = restoreInput.files?.[0];
+      restoreInput.value = '';
+      restore(file);
+    });
     const tos = find('#tsl-tos');
     const tosToggle = find('#tsl-tos-toggle');
     const setTos = (open) => {

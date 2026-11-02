@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0 — 2026-11-02
+
+### New: Torn Stock Ledger website
+- **Use the ledger in any browser, with no userscript: [https://eaglewing91.github.io/torn-day-trader-logbook/](https://eaglewing91.github.io/torn-day-trader-logbook/)**. It works on phones and PCs without Tampermonkey or TornPDA.
+- It's the same ledger, built from this script: the same maths, views, filters, CSV export and ToS button.
+- It runs entirely in your browser. The only network requests go to `api.torn.com`, and your key and trades are kept in that browser's storage. Nothing goes to GitHub or any other server.
+- **Remember key** option: untick it and the key is only kept until you close the page.
+- The key is sent in the request header. If your browser blocks that header for Torn's API, the site sends the key in the request address instead (still only to `api.torn.com`) and remembers that choice.
+
+### New in the userscript and the website
+- **Backup** downloads your imported trades, checked dates, manual buy prices and stock names as a file. It never includes your API key.
+- **Restore** loads a backup and merges it with what's already there. Use it to move your history between the userscript and the website, or to another device, without importing it again from the API.
+
 ## 1.2.3 — 2026-11-02
 
 ### Fixed

@@ -1,11 +1,19 @@
 # Torn Stock Ledger
 
 **Stock trade history and profit tracking for Torn**  
-Version **1.2.3** · Created by **Eaglewing [571041]**
+Version **1.3.0** · Created by **Eaglewing [571041]**
 
 Torn Stock Ledger is the newly developed, fully working release of **Torn Day Trader Logbook (Experimental)**. It gives your stock trades a dedicated page within Torn, with a clear view of buying costs, selling fees and profit.
 
-## Install
+## Use it on the website (no install)
+
+**[Open Torn Stock Ledger](https://eaglewing91.github.io/torn-day-trader-logbook/)** in any browser, on PC or phone. Paste your API key and choose a range.
+
+The website runs entirely in your browser: it only talks to `api.torn.com`, and your key and trades stay in that browser's storage. Tick or untick **Remember key** to choose whether the key is kept for next time.
+
+Already using the userscript? Click **Backup** on the ledger page in Torn, then **Restore** that file on the website to bring your history across without importing it again.
+
+## Or install the userscript
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
 2. **[Install Torn Stock Ledger](https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js)** and confirm the installation in Tampermonkey.
@@ -35,6 +43,10 @@ The first Full History import may take a minute or two. Its progress bar tracks 
 ## Data and accuracy
 
 Your API key and trade cache are stored locally in Tampermonkey (or TornPDA). The key is sent only to Torn's API, in the request header, to request your data. If Torn's older v1 stock-names call rejects the header, that one call sends the key in the address instead (still only to api.torn.com). Torn's rounding may cause small differences between displayed calculations and settled amounts. A sale with no known buy cost shows no calculated profit until you enter a manual buy price.
+
+## Website build
+
+The website in `docs/` is generated from the userscript, so both always share the same ledger maths. After changing `torn-day-trader-logbook.user.js`, run `python3 tools/build-site.py` and commit the updated `docs/` files.
 
 ## Updates
 
