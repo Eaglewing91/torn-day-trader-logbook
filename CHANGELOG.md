@@ -1,10 +1,5 @@
 # Changelog
 
-## 1.2.4 — 2026-11-02
-
-### Changed
-- **Switching between 7D, 14D and 30D never makes an API request** once your history is imported. Each range is shown from the cache, up to your last check, however long ago that was. Only **Refresh** and **Full History** fetch newer trades. A range button still imports if it reaches dates that were never imported (for example the first time you use the ledger).
-
 ## 1.2.3 — 2026-11-02
 
 ### Fixed

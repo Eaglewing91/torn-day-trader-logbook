@@ -1,7 +1,7 @@
 # Torn Stock Ledger
 
 **Stock trade history and profit tracking for Torn**  
-Version **1.2.4** · Created by **Eaglewing [571041]**
+Version **1.2.3** · Created by **Eaglewing [571041]**
 
 Torn Stock Ledger is the newly developed, fully working release of **Torn Day Trader Logbook (Experimental)**. It gives your stock trades a dedicated page within Torn, with a clear view of buying costs, selling fees and profit.
 
