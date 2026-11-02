@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.2 — 2026-11-02
+
+### Faster
+- **Switching to 7D, 14D or 30D after a full report shows your cached trades straight away.** Only the last few minutes still need checking, and that check now runs after the trades are on screen, so it can wait for the API rate limit without the page looking stuck.
+- **The saved trade cache is only rewritten when new trades arrive.** Checking a range that has nothing new no longer rewrites your whole trade history in storage, which could take a moment with a large history.
+
 ## 1.2.1 — 2026-11-01
 
 ### Changed

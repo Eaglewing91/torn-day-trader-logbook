@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.2.1
+// @version      1.2.2
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -425,7 +425,7 @@
     const percent = () => total ? Math.min(100, Math.floor(done * 100 / total)) : 100;
     const flush = () => {
       if (!dirty && !covered.length) return;
-      GM_setValue(KEY.logs, cache);
+      if (dirty) GM_setValue(KEY.logs, cache);
       if (covered.length) GM_setValue(KEY.coverage, normalizeCoverage([...coverage(), ...covered]));
       covered = [];
       dirty = 0;
@@ -446,11 +446,13 @@
         if (entries.some(entry => entry.timestamp < first || entry.timestamp > last)) {
           throw new Error('The API returned trades outside the requested dates. Progress was saved.');
         }
+        let fresh = 0;
         for (const entry of entries) {
-          if (!cache[entry.id]) added++;
+          if (!cache[entry.id]) { added++; fresh++; }
           cache[entry.id] = entry;
         }
-        dirty++;
+        // Only rewrite the (possibly large) trade cache when something new arrived; date coverage is saved either way.
+        if (fresh) dirty++;
         if (entries.length >= PAGE_LIMIT || data._metadata.links.next) {
           if (first === last) throw new Error('More than 100 trades occurred in one second. Progress was saved.');
           const middle = first + Math.floor((last - first) / 2);
@@ -461,7 +463,7 @@
         if (coveredEnd >= first) covered.push([first, coveredEnd]);
         done += last - first + 1;
         queue.shift();
-        if (dirty >= FLUSH_EVERY) flush();
+        if (dirty >= FLUSH_EVERY || covered.length >= FLUSH_EVERY) flush();
         report({ percent: percent(), message: requests + ' requests · ' + added + ' new trades · ' +
           queue.length + ' windows left' });
       }
@@ -1228,6 +1230,14 @@
           { from: signup, to: now(), label: 'Full History', mode: 'full' } : selectedRange(mode);
         state.view = view;
         updateRangeButtons();
+        // Already imported up to the last hour (e.g. after a full report)? Show the cached trades straight
+        // away; only the last few minutes still need checking, and that can wait for the API rate limit.
+        const gaps = missingIntervals(signup, view.to);
+        if (coverage().length && gaps.every(([a]) => a >= now() - 3600)) {
+          state.stockMap = readObject(KEY.stockMap);
+          render();
+          setProgress(null, gaps.length ? 'Showing your cached trades · checking the last few minutes…' : 'Showing your cached trades.');
+        }
         if (missingIntervals(signup, view.to).length > 1 || !coverage().length) {
           setProgress(null, 'Fetching your earlier trades once so every sell has a buy price…');
         }
