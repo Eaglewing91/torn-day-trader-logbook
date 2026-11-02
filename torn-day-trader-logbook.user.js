@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.2.2
+// @version      1.2.3
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -1207,7 +1207,7 @@
 
     // Every view imports from account creation, so each sell can be matched
     // with its earlier buys. After the first run only new dates are fetched.
-    async function pull(mode) {
+    async function pull(mode, { preferCache = false } = {}) {
       if (state.busy) return;
       let key;
       try {
@@ -1230,12 +1230,20 @@
           { from: signup, to: now(), label: 'Full History', mode: 'full' } : selectedRange(mode);
         state.view = view;
         updateRangeButtons();
-        // Already imported up to the last hour (e.g. after a full report)? Show the cached trades straight
-        // away; only the last few minutes still need checking, and that can wait for the API rate limit.
+        // Already imported up to the last few minutes (e.g. just after a full report)? Show the cached trades
+        // straight away. A range button (7D/14D/30D) then stops there, with no API call, so switching views never
+        // waits for the API rate limit; "Refresh" still checks the last few minutes.
         const gaps = missingIntervals(signup, view.to);
         if (coverage().length && gaps.every(([a]) => a >= now() - 3600)) {
           state.stockMap = readObject(KEY.stockMap);
           render();
+          const lastChecked = Math.min(now(), (coverage().slice(-1)[0] || [0, 0])[1]);
+          if (preferCache && gaps.every(([a]) => a >= now() - 600)) {
+            setStatus(view.label + ': showing your cached trades, checked up to ' +
+              new Date(lastChecked * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) +
+              '. Press Refresh to check for newer trades.');
+            return;
+          }
           setProgress(null, gaps.length ? 'Showing your cached trades · checking the last few minutes…' : 'Showing your cached trades.');
         }
         if (missingIntervals(signup, view.to).length > 1 || !coverage().length) {
@@ -1279,7 +1287,7 @@
         toInput.value = '';
         GM_setValue(KEY.from, '');
         GM_setValue(KEY.to, '');
-        if (keyInput.value.trim()) pull('days');
+        if (keyInput.value.trim()) pull('days', { preferCache: true });
         else {
           state.view = selectedRange('days');
           updateRangeButtons();
@@ -1293,7 +1301,7 @@
       GM_setValue(KEY.from, '');
       GM_setValue(KEY.to, '');
       if (state.view?.mode === 'dates') {
-        if (keyInput.value.trim()) pull('days');
+        if (keyInput.value.trim()) pull('days', { preferCache: true });
         else {
           state.view = selectedRange('days');
           updateRangeButtons();

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.3 — 2026-11-02
+
+### Fixed
+- **No more pause when switching ranges after a full report.** 7D, 14D and 30D now show your cached trades with no API call when your history was checked in the last 10 minutes. Before, each range button re-checked the last minute of your log, and straight after a big full report that one call could wait up to a minute for the API rate limit, with the buttons locked. **Refresh** still checks for newer trades.
+
 ## 1.2.2 — 2026-11-02
 
 ### Faster
