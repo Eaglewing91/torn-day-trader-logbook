@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.2.3
+// @version      1.2.4
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -1230,20 +1230,25 @@
           { from: signup, to: now(), label: 'Full History', mode: 'full' } : selectedRange(mode);
         state.view = view;
         updateRangeButtons();
-        // Already imported up to the last few minutes (e.g. just after a full report)? Show the cached trades
-        // straight away. A range button (7D/14D/30D) then stops there, with no API call, so switching views never
-        // waits for the API rate limit; "Refresh" still checks the last few minutes.
+        // Switching between 7D / 14D / 30D never calls the API once your history is imported: the trades come
+        // from the cache, up to your last check. Only "Refresh" (or Full History) fetches newer trades. A range
+        // button still imports if it covers dates that were never imported (for example on first use).
         const gaps = missingIntervals(signup, view.to);
-        if (coverage().length && gaps.every(([a]) => a >= now() - 3600)) {
+        const lastChecked = Math.min(now(), (coverage().slice(-1)[0] || [0, 0])[1]);
+        const onlyNewer = coverage().length && gaps.every(([a]) => a > lastChecked);
+        if (preferCache && onlyNewer) {
           state.stockMap = readObject(KEY.stockMap);
           render();
-          const lastChecked = Math.min(now(), (coverage().slice(-1)[0] || [0, 0])[1]);
-          if (preferCache && gaps.every(([a]) => a >= now() - 600)) {
-            setStatus(view.label + ': showing your cached trades, checked up to ' +
+          {
+            setStatus(view.label.charAt(0).toUpperCase() + view.label.slice(1) + ': showing your cached trades, checked up to ' +
               new Date(lastChecked * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) +
               '. Press Refresh to check for newer trades.');
             return;
           }
+        }
+        if (coverage().length && gaps.every(([a]) => a >= now() - 3600)) {
+          state.stockMap = readObject(KEY.stockMap);
+          render();
           setProgress(null, gaps.length ? 'Showing your cached trades · checking the last few minutes…' : 'Showing your cached trades.');
         }
         if (missingIntervals(signup, view.to).length > 1 || !coverage().length) {
