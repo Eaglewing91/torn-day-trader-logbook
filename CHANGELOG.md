@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1 — 2026-11-25
+
+### Changed
+- **Simpler summary:** the cards are now **Capital** and **Profit** side by side, with **Fees Paid** below. Buy Cost and Sell Proceeds are removed; Profit's ROI and Per trade figures already cover them. On phones the cards stack.
+
 ## 1.5.0 — 2026-11-25
 
 ### New

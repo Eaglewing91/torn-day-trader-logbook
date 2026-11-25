@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.5.0
+// @version      1.5.1
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -662,7 +662,7 @@
     #tsl-page .tab{padding:6px 10px;border-radius:7px;border:1px solid #624049!important;
       background:#21171a!important;color:#eadadd!important;font-weight:700}
     #tsl-page .tab.active{border-color:#f47681!important;background:#a92d3b!important;color:#fff!important}
-    #tsl-page .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));
+    #tsl-page .summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
       gap:10px;padding:13px 20px 18px}
     #tsl-page .card{min-width:0;padding:13px;border-radius:9px;border:1px solid var(--line);
       background:var(--surface)}
@@ -745,7 +745,7 @@
     #tsl-page .tip{position:fixed;z-index:999999;max-width:260px;padding:6px 9px;border-radius:6px;
       border:1px solid #8a3442;background:#120c0e;color:#f6eef0;font-size:11px;line-height:1.35;
       pointer-events:none;box-shadow:0 6px 18px #0008}
-    @media(max-width:520px){#tsl-page .tos-table>div{grid-template-columns:1fr}}
+    @media(max-width:520px){#tsl-page .tos-table>div,#tsl-page .summary{grid-template-columns:1fr}}
     @media(max-width:850px){
       #tsl-page .header,#tsl-page .toolbar,#tsl-page .filterbar{padding-left:12px;padding-right:12px}
       #tsl-page .tabs{padding-left:12px}
@@ -1267,11 +1267,9 @@
       const summary = find('#tsl-summary');
       summary.replaceChildren();
       for (const [label, value, title, special] of [
-        ['Buy Cost', totals.cost, 'Average buy cost of the shares sold in this range'],
-        ['Sell Proceeds', totals.net, 'What those sales paid out after the 0.1% fee'],
-        ['Profit', totals.profit, 'Sell proceeds minus buy cost. ROI is profit on your capital; per trade is profit on buy cost', true],
-        ['Fees Paid', totals.fee, 'Sale fees on every sell in this range'],
-        ['Capital', totals.capital, 'The most money you had invested at once in the stocks traded in this range (at cost), not counting holdings you exclude']
+        ['Capital', totals.capital, 'The most money you had invested at once in the stocks traded in this range (at cost), not counting holdings you exclude'],
+        ['Profit', totals.profit, 'Sell proceeds after fees minus buy cost. ROI is profit on capital; per trade is profit on buy cost', true],
+        ['Fees Paid', totals.fee, 'Sale fees on every sell in this range']
       ]) {
         const card = document.createElement('div');
         card.className = 'card' + (special ? ' profit' : '');
