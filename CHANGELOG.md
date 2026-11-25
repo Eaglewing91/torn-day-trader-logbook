@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.0 — 2026-11-25
+
+### New
+- **Capital card:** the most money you had invested at once in the stocks traded in the selected range, at cost. Selling a stock and putting the same money into the next one counts once, so it reflects the fund you actually trade with.
+- **ROI is now profit on that capital.** The old figure, profit divided by the total buy cost of every trade, is still shown underneath as **Per trade**. For example, rotating about $122B through seven trades in a week for $1.70B profit shows ROI +1.40% and Per trade +0.21%.
+- Both follow the stock tabs: selecting one stock shows the capital and ROI for that stock only.
+
 ## 1.3.0 — 2026-11-02
 
 ### New: Torn Stock Ledger website

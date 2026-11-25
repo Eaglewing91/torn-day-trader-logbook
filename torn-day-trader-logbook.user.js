@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.3.0
+// @version      1.4.0
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
@@ -501,13 +501,15 @@
     for (const event of events) {
       const lot = holdings.get(event.ticker) || { shares: 0, cost: 0 };
       holdings.set(event.ticker, lot);
+      // Money held in this stock (at cost) before and after the trade, used for return on capital.
+      const heldBefore = lot.cost;
       if (event.action === 'BUY') {
         lot.shares += event.shares;
         lot.cost += event.spent;
         rows.push({
           ...event, buyPrice: event.price, sellPrice: null, gross: null, fee: 0,
           cost: event.spent, net: null, profit: null, manual: false, editable: false,
-          tracked: 0, untracked: 0, trackedAvg: null
+          tracked: 0, untracked: 0, trackedAvg: null, heldBefore, heldAfter: lot.cost
         });
         continue;
       }
@@ -540,7 +542,7 @@
         ...event, buyPrice: cost == null ? null : cost / event.shares, sellPrice: event.price,
         gross, fee, cost, net, profit: cost == null ? null : net - cost,
         manual: manualUsed, editable: untracked > 0,
-        tracked, untracked, trackedAvg: tracked > 0 ? trackedAvg : null
+        tracked, untracked, trackedAvg: tracked > 0 ? trackedAvg : null, heldBefore, heldAfter: lot.cost
       });
     }
     return { rows: rows.reverse(), holdings };
@@ -616,6 +618,7 @@
     #tsl-page .card .roi{display:block;margin-top:4px;font-size:12px;font-weight:700}
     #tsl-page .card .roi.positive{color:var(--green)}
     #tsl-page .card .roi.negative{color:#ff8a96}
+    #tsl-page .card .roi.muted{margin-top:2px;color:var(--muted);font-weight:600}
     #tsl-page .missing{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 20px 12px;
       padding:9px 12px;border:1px solid #9a6b2f;border-radius:8px;background:#2a1f12;color:#f3d7a8}
     #tsl-page .positions{padding:0 20px 14px}
@@ -1019,6 +1022,23 @@
       }
     }
 
+    // The most money that was invested at once (at cost) in the stocks traded in
+    // this range: what they already held when the range started, then after
+    // each second with trades. Selling and rebuying the same money therefore
+    // counts once, unlike Buy Cost, which adds up every trade.
+    function peakCapital(rows) {
+      const ordered = [...rows].sort((a, b) => a.ts - b.ts);
+      const held = new Map();
+      for (const row of ordered) if (!held.has(row.ticker)) held.set(row.ticker, row.heldBefore);
+      const total = () => [...held.values()].reduce((sum, value) => sum + value, 0);
+      let peak = total();
+      for (let i = 0; i < ordered.length; i++) {
+        held.set(ordered[i].ticker, ordered[i].heldAfter);
+        if (i === ordered.length - 1 || ordered[i + 1].ts !== ordered[i].ts) peak = Math.max(peak, total());
+      }
+      return peak;
+    }
+
     function render() {
       hideTip();
       const view = state.view;
@@ -1059,15 +1079,19 @@
         net: complete.reduce((sum, row) => sum + row.net, 0),
         profit: complete.reduce((sum, row) => sum + row.profit, 0),
         fee: sells.reduce((sum, row) => sum + row.fee, 0),
-        bought: stockRows.filter(row => row.action === 'BUY').reduce((sum, row) => sum + row.spent, 0)
+        bought: stockRows.filter(row => row.action === 'BUY').reduce((sum, row) => sum + row.spent, 0),
+        capital: peakCapital(stockRows)
       };
+      const percent = (value) => value == null ? '—' : (value > 0 ? '+' : '') +
+        value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
       const summary = find('#tsl-summary');
       summary.replaceChildren();
       for (const [label, value, title, special] of [
         ['Buy Cost', totals.cost, 'Average buy cost of the shares sold in this range'],
         ['Sell Proceeds', totals.net, 'What those sales paid out after the 0.1% fee'],
-        ['Profit', totals.profit, 'Sell proceeds minus buy cost', true],
-        ['Fees Paid', totals.fee, 'Sale fees on every sell in this range']
+        ['Profit', totals.profit, 'Sell proceeds minus buy cost. ROI is profit on your capital; per trade is profit on buy cost', true],
+        ['Fees Paid', totals.fee, 'Sale fees on every sell in this range'],
+        ['Capital', totals.capital, 'The most money you had invested at once in the stocks traded in this range (at cost)']
       ]) {
         const card = document.createElement('div');
         card.className = 'card' + (special ? ' profit' : '');
@@ -1079,14 +1103,15 @@
         if (special) amount.className = value >= 0 ? 'positive' : 'negative';
         card.append(caption, amount);
         if (special) {
-          const roi = totals.cost > 0 ? totals.profit / totals.cost * 100 : null;
+          const roi = totals.capital > 0 && complete.length ? totals.profit / totals.capital * 100 : null;
+          const perTrade = totals.cost > 0 ? totals.profit / totals.cost * 100 : null;
           const percentage = document.createElement('span');
           percentage.className = 'roi' + (roi == null ? '' : roi >= 0 ? ' positive' : ' negative');
-          percentage.textContent = 'ROI: ' + (roi == null ? '—' :
-            (roi > 0 ? '+' : '') + roi.toLocaleString(undefined, {
-              minimumFractionDigits: 2, maximumFractionDigits: 2
-            }) + '%');
-          card.appendChild(percentage);
+          percentage.textContent = 'ROI: ' + percent(roi);
+          const margin = document.createElement('span');
+          margin.className = 'roi muted';
+          margin.textContent = 'Per trade: ' + percent(perTrade);
+          card.append(percentage, margin);
         }
         summary.appendChild(card);
       }
