@@ -1,7 +1,7 @@
 # Torn Stock Ledger
 
 **Stock trade history and profit tracking for Torn**  
-Version **1.4.0** · Created by **Eaglewing [571041]**
+Version **1.5.0** · Created by **Eaglewing [571041]**
 
 Torn Stock Ledger is the newly developed, fully working release of **Torn Day Trader Logbook (Experimental)**. It gives your stock trades a dedicated page within Torn, with a clear view of buying costs, selling fees and profit.
 
@@ -34,7 +34,7 @@ Already using the userscript? Click **Backup** on the ledger page in Torn, then 
 
 ## Getting started
 
-1. Enter a Torn API key on the ledger page: a **Custom key** with **user → log, profile** and **torn → stocks** (recommended), or a Full Access key. You can use **Test Key** to check it, and **ToS** to see how the key is used. On TornPDA your key is filled in for you.
+1. Enter a Torn API key on the ledger page: a **Custom key** with **user → log, profile, stocks** and **torn → stocks** (recommended; **stocks** is only needed for the Holdings tab), or a Full Access key. You can use **Test Key** to check it, and **ToS** to see how the key is used. On TornPDA your key is filled in for you.
 2. Choose **7D**, **14D**, **30D**, or both **From** and **To** dates. Choose **Full History** to retrieve all available account history with one click.
 3. Select a trade to see its full breakdown. Use **Refresh** to update the selected range.
 

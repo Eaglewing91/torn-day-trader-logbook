@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Torn Stock Ledger
 // @namespace    https://github.com/Eaglewing91
-// @version      1.4.0
+// @version      1.5.0
 // @author       Eaglewing [571041]
 // @homepageURL  https://github.com/Eaglewing91/torn-day-trader-logbook
 // @updateURL    https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
 // @downloadURL  https://raw.githubusercontent.com/Eaglewing91/torn-day-trader-logbook/main/torn-day-trader-logbook.user.js
-// @description  View your Torn stock trades, costs, fees and profit for 7/14/30 days, custom dates or your full account history. Uses only your own API data; your key and trades are stored locally and never shared. Requires a Custom key (user log + profile, torn stocks) or a Full Access key.
+// @description  View your Torn stock trades, costs, fees and profit for 7/14/30 days, custom dates or your full account history. Uses only your own API data; your key and trades are stored locally and never shared. Requires a Custom key (user log, profile, stocks; torn stocks) or a Full Access key.
 // @match        https://www.torn.com/page.php?sid=stocks*
 // @run-at       document-idle
 // @noframes
@@ -21,7 +21,7 @@
 // Terms of Service (also shown in-page via the ToS button next to the key box)
 // | Data Storage            | Data Sharing | Purpose of Use                                   | Key Storage & Sharing                        | Key Access Level                                       |
 // |-------------------------|--------------|--------------------------------------------------|----------------------------------------------|--------------------------------------------------------|
-// | Only locally            | Nobody       | Non malicious statistical analysis (own stock    | Stored locally (Tampermonkey) / Not shared;  | Custom - user: log, profile; torn: stocks              |
+// | Only locally            | Nobody       | Non malicious statistical analysis (own stock    | Stored locally (Tampermonkey) / Not shared;  | Custom - user: log, profile, stocks; torn: stocks      |
 // | (Tampermonkey storage)  |              | trade costs, fees and profit)                    | used only for api.torn.com calls             | (or Full Access)                                       |
 //
 // On the Stocks page a "Torn Stock Ledger" link is added to the header. On the
@@ -64,7 +64,9 @@
     lock: 'torn_stock_ledger_import_lock_v1',
     compacted: 'torn_stock_ledger_compacted_v1',
     pause: 'torn_stock_ledger_api_pause_v1',
-    v1Query: 'torn_stock_ledger_v1_query_key_v1'
+    v1Query: 'torn_stock_ledger_v1_query_key_v1',
+    holdings: 'torn_stock_ledger_holdings_v1',
+    excluded: 'torn_stock_ledger_excluded_v1'
   });
   const API_COMMENT = 'StockLedger';
   // TornPDA swaps this placeholder for the user's key. It is split so PDA's
@@ -193,7 +195,7 @@
   }
 
   // ---------- API ----------
-  const KEY_HELP = 'Use a Custom key with user → log and profile and torn → stocks, or a Full Access key.';
+  const KEY_HELP = 'Use a Custom key with user → log, profile and stocks and torn → stocks, or a Full Access key.';
   const API_ERRORS = {
     1: 'No API key reached Torn. Enter your key and try again.',
     2: 'Incorrect API key. Check the key and try again.',
@@ -330,15 +332,67 @@
     throw new Error('Could not reach the Torn API.');
   }
 
+  // Your current holdings as Torn lists them: one entry per purchase, with its
+  // own buy price and date. Saved so the Holdings tab shows without a call.
+  async function holdingsFor(key, report) {
+    const keyInQuery = Boolean(GM_getValue(KEY.v1Query, false));
+    let data;
+    try {
+      try {
+        data = await apiJSON('/user/', { selections: 'stocks' }, report, { key, keyInQuery });
+      } catch (error) {
+        if (keyInQuery || !(error instanceof ApiError) || (error.code !== 1 && error.code !== 2)) throw error;
+        data = await apiJSON('/user/', { selections: 'stocks' }, report, { key, keyInQuery: true });
+        GM_setValue(KEY.v1Query, true);
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 16) {
+        const saved = { at: now(), list: [], error: 'access' };
+        GM_setValue(KEY.holdings, saved);
+        return saved;
+      }
+      throw error;
+    }
+    const list = [];
+    for (const [id, stock] of Object.entries(data?.stocks && typeof data.stocks === 'object' ? data.stocks : {})) {
+      const stockId = String(stock?.stock_id ?? id);
+      if (!/^\d{1,6}$/.test(stockId)) continue;
+      const purchases = stock?.transactions && typeof stock.transactions === 'object' ?
+        Object.entries(stock.transactions) : [];
+      for (const [txid, purchase] of purchases) {
+        const shares = Number(purchase?.shares);
+        const price = Number(purchase?.bought_price);
+        const time = Number(purchase?.time_bought);
+        if (!(shares > 0) || !/^[A-Za-z0-9_-]{1,40}$/.test(String(txid))) continue;
+        list.push({ id: stockId + ':' + txid, stock: stockId, shares,
+          price: price > 0 ? price : null, time: Number.isSafeInteger(time) && time > 0 ? time : 0 });
+      }
+      if (!purchases.length && Number(stock?.total_shares) > 0) {
+        list.push({ id: stockId + ':all', stock: stockId, shares: Number(stock.total_shares), price: null, time: 0 });
+      }
+    }
+    const saved = { at: now(), list };
+    GM_setValue(KEY.holdings, saved);
+    // Forget exclusions for holdings that have since been sold.
+    const excluded = readObject(KEY.excluded);
+    const current = new Set(list.map(item => item.id));
+    let changed = false;
+    for (const id of Object.keys(excluded)) if (!current.has(id)) { delete excluded[id]; changed = true; }
+    if (changed) GM_setValue(KEY.excluded, excluded);
+    return saved;
+  }
+
   // Stock names are cached, but refreshed (at most hourly) when a trade
   // references a stock ID the cache does not know, e.g. a newly added stock.
   async function stockMapFor(key, report) {
     const saved = readObject(KEY.stockMap);
     const used = new Set(Object.values(readObject(KEY.logs))
       .map(log => String(log?.data?.stock ?? '')).filter(Boolean));
+    // Older caches have no benefit block sizes; they are loaded once on the next import.
     const unknown = [...used].some(id => !saved[id]);
+    const needBlocks = Object.values(saved).some(stock => !stock || typeof stock !== 'object' || !('block' in stock));
     const fresh = Date.now() - Number(GM_getValue(KEY.stockMapTs, 0)) < STOCK_MAP_TTL;
-    if (Object.keys(saved).length && (!unknown || fresh)) return saved;
+    if (Object.keys(saved).length && !needBlocks && (!unknown || fresh)) return saved;
     try {
       // /torn/?selections=stocks is a v1 endpoint. The key goes in the header;
       // if Torn's v1 rejects that (error 1/2 after the log calls succeeded with
@@ -354,7 +408,8 @@
       }
       const map = { ...saved };
       for (const [id, stock] of Object.entries(data.stocks || {})) {
-        map[id] = { acronym: stock.acronym || stock.name || id, name: stock.name || id };
+        map[id] = { acronym: stock.acronym || stock.name || id, name: stock.name || id,
+          block: Number(stock.benefit?.requirement) > 0 ? Number(stock.benefit.requirement) : 0 };
       }
       GM_setValue(KEY.stockMap, map);
       GM_setValue(KEY.stockMapTs, Date.now());
@@ -503,13 +558,15 @@
       holdings.set(event.ticker, lot);
       // Money held in this stock (at cost) before and after the trade, used for return on capital.
       const heldBefore = lot.cost;
+      const sharesBefore = lot.shares;
       if (event.action === 'BUY') {
         lot.shares += event.shares;
         lot.cost += event.spent;
         rows.push({
           ...event, buyPrice: event.price, sellPrice: null, gross: null, fee: 0,
           cost: event.spent, net: null, profit: null, manual: false, editable: false,
-          tracked: 0, untracked: 0, trackedAvg: null, heldBefore, heldAfter: lot.cost
+          tracked: 0, untracked: 0, trackedAvg: null, heldBefore, heldAfter: lot.cost,
+          sharesBefore, sharesAfter: lot.shares
         });
         continue;
       }
@@ -542,7 +599,8 @@
         ...event, buyPrice: cost == null ? null : cost / event.shares, sellPrice: event.price,
         gross, fee, cost, net, profit: cost == null ? null : net - cost,
         manual: manualUsed, editable: untracked > 0,
-        tracked, untracked, trackedAvg: tracked > 0 ? trackedAvg : null, heldBefore, heldAfter: lot.cost
+        tracked, untracked, trackedAvg: tracked > 0 ? trackedAvg : null, heldBefore, heldAfter: lot.cost,
+        sharesBefore, sharesAfter: lot.shares
       });
     }
     return { rows: rows.reverse(), holdings };
@@ -625,7 +683,17 @@
     #tsl-page .position-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,170px),1fr));gap:8px}
     #tsl-page .position{padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:#161012;
       font-variant-numeric:tabular-nums}
-    #tsl-page .position b{display:block;font-size:13px;margin-bottom:3px}
+    #tsl-page .position b{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:13px;margin-bottom:3px}
+    #tsl-page .holding-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:8px}
+    #tsl-page .holding.excluded{opacity:.6}
+    #tsl-page .holding b i{margin-right:auto;margin-left:6px;padding:1px 5px;border-radius:4px;background:#2b1d20;
+      color:var(--muted);font:700 9px/1.4 inherit;font-style:normal}
+    #tsl-page .exclude-toggle{height:22px;padding:0 8px;border:1px solid var(--line)!important;border-radius:5px;
+      background:transparent!important;color:var(--text)!important;font:700 10px/1 inherit;cursor:pointer}
+    #tsl-page .exclude-toggle.on{border-color:var(--red)!important;background:var(--red)!important;color:#fff!important}
+    #tsl-page .tab.holdings-tab{margin-left:auto}
+    #tsl-page.holdings-view #tsl-action,#tsl-page.holdings-view label[for="tsl-action"],
+    #tsl-page.holdings-view #tsl-clear-filters,#tsl-page.holdings-view #tsl-export{display:none}
     #tsl-page .position span{display:block;color:var(--muted);font-size:11px}
     #tsl-page .trades{display:grid;width:100%;min-width:0;gap:6px;padding:0 20px 20px}
     #tsl-page .trade-card{display:block;width:100%;min-width:0;
@@ -745,7 +813,7 @@
           <div role="row"><b role="rowheader">Data Sharing</b><span role="cell">Nobody</span></div>
           <div role="row"><b role="rowheader">Purpose of Use</b><span role="cell">Non malicious statistical analysis of your own stock trades (costs, fees and profit)</span></div>
           <div role="row"><b role="rowheader">Key Storage &amp; Sharing</b><span role="cell">Stored locally / Not shared. Used only for calls to api.torn.com, sent in the Authorization header (if Torn's older stock-names call rejects the header, that one call sends it in the address instead)</span></div>
-          <div role="row"><b role="rowheader">Key Access Level</b><span role="cell">Custom: user → log, profile; torn → stocks. A Full Access key also works</span></div>
+          <div role="row"><b role="rowheader">Key Access Level</b><span role="cell">Custom: user → log, profile, stocks; torn → stocks. A Full Access key also works</span></div>
         </div>
         <p class="tos-note">The key and your trade cache never leave your device except in requests to Torn's own API.
           Calls are labelled "StockLedger" in your Torn API access log. Clear the key field to delete the stored key.
@@ -839,7 +907,8 @@
     const state = {
       days: ['7', '14', '30'].includes(savedRange) ? savedRange : '7',
       ticker: String(GM_getValue(KEY.ticker, 'ALL')),
-      stockMap: readObject(KEY.stockMap), view: null, busy: false, shown: []
+      stockMap: readObject(KEY.stockMap), view: null, busy: false, shown: [],
+      panel: 'trades', loadingHoldings: false
     };
     keyInput.value = String(GM_getValue(KEY.api, ''));
     // On TornPDA, offer the app's own key when none is saved yet. It is only
@@ -1022,18 +1091,120 @@
       }
     }
 
+    const tickerOf = (stockId) => {
+      const stock = state.stockMap?.[stockId];
+      return typeof stock === 'string' ? stock : stock?.acronym || stockId;
+    };
+    function exclusionsByTicker() {
+      const excluded = readObject(KEY.excluded);
+      const out = {};
+      for (const item of readObject(KEY.holdings).list || []) {
+        if (!excluded[item.id]) continue;
+        (out[tickerOf(item.stock)] ||= []).push(item);
+      }
+      return out;
+    }
+
+    // Loads holdings once when the Holdings tab is opened and none are saved
+    // (or they are over 5 minutes old). One API call, only on that click.
+    async function openHoldings() {
+      state.panel = 'holdings';
+      render();
+      const saved = readObject(KEY.holdings);
+      const key = keyInput.value.trim();
+      if (state.busy || state.loadingHoldings || !key || (saved.at && now() - saved.at < 300)) return;
+      state.loadingHoldings = true;
+      render();
+      try {
+        await holdingsFor(key, setStatus);
+      } catch (error) {
+        setStatus(error.message || String(error));
+      } finally {
+        state.loadingHoldings = false;
+        render();
+      }
+    }
+
+    function renderHoldings(results) {
+      const saved = readObject(KEY.holdings);
+      const excluded = readObject(KEY.excluded);
+      const note = (text) => {
+        const box = document.createElement('div');
+        box.className = 'note';
+        box.textContent = text;
+        results.appendChild(box);
+      };
+      if (state.loadingHoldings) return note('Loading holdings…');
+      if (saved.error === 'access') return note('Add user → stocks to your API key to see your holdings.');
+      if (!saved.at) return note(keyInput.value.trim() ? 'No holdings loaded yet.' : 'Enter your API key to see your holdings.');
+      const list = [...(saved.list || [])].sort((a, b) =>
+        tickerOf(a.stock).localeCompare(tickerOf(b.stock)) || a.time - b.time);
+      find('#tsl-count').textContent = quantity(list.length) + (list.length === 1 ? ' holding' : ' holdings') +
+        ' · updated ' + new Date(saved.at * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+      if (!list.length) return note('You have no stock holdings.');
+      const grid = document.createElement('div');
+      grid.className = 'holding-grid';
+      for (const item of list) {
+        const off = Boolean(excluded[item.id]);
+        const card = document.createElement('div');
+        card.className = 'position holding' + (off ? ' excluded' : '');
+        const name = document.createElement('b');
+        name.textContent = tickerOf(item.stock);
+        const block = Number(state.stockMap?.[item.stock]?.block);
+        if (block > 0 && item.shares === block) {
+          const tag = document.createElement('i');
+          tag.textContent = 'Block';
+          name.appendChild(tag);
+        }
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'exclude-toggle' + (off ? ' on' : '');
+        toggle.textContent = off ? 'Excluded' : 'Exclude';
+        toggle.setAttribute('aria-pressed', String(off));
+        toggle.dataset.tip = off ? 'Count this holding in capital again' : 'Leave this holding out of capital';
+        toggle.addEventListener('click', () => {
+          const current = readObject(KEY.excluded);
+          if (current[item.id]) delete current[item.id];
+          else current[item.id] = true;
+          GM_setValue(KEY.excluded, current);
+          render();
+        });
+        name.appendChild(toggle);
+        const shares = document.createElement('span');
+        shares.textContent = quantity(item.shares) + ' shares';
+        const bought = document.createElement('span');
+        bought.textContent = (item.price != null ? currency(item.price, 2) + ' · ' + currency(item.shares * item.price) : 'Buy price unknown') +
+          (item.time ? ' · ' + stamp(item.time).slice(0, 10) : '');
+        card.append(name, shares, bought);
+        grid.appendChild(card);
+      }
+      results.appendChild(grid);
+    }
+
     // The most money that was invested at once (at cost) in the stocks traded in
     // this range: what they already held when the range started, then after
     // each second with trades. Selling and rebuying the same money therefore
-    // counts once, unlike Buy Cost, which adds up every trade.
-    function peakCapital(rows) {
+    // counts once, unlike Buy Cost, which adds up every trade. Holdings you
+    // exclude (Holdings tab) are left out from the time they were bought.
+    function peakCapital(rows, from, exclusions = {}) {
       const ordered = [...rows].sort((a, b) => a.ts - b.ts);
+      const trading = (ticker, cost, shares, ts) => {
+        let out = 0;
+        for (const item of exclusions[ticker] || []) {
+          if (item.time > ts) continue;
+          out += item.price != null ? item.shares * item.price : (shares > 0 ? cost / shares * item.shares : 0);
+        }
+        return Math.max(0, cost - out);
+      };
       const held = new Map();
-      for (const row of ordered) if (!held.has(row.ticker)) held.set(row.ticker, row.heldBefore);
+      for (const row of ordered) {
+        if (!held.has(row.ticker)) held.set(row.ticker, trading(row.ticker, row.heldBefore, row.sharesBefore, from));
+      }
       const total = () => [...held.values()].reduce((sum, value) => sum + value, 0);
       let peak = total();
       for (let i = 0; i < ordered.length; i++) {
-        held.set(ordered[i].ticker, ordered[i].heldAfter);
+        const row = ordered[i];
+        held.set(row.ticker, trading(row.ticker, row.heldAfter, row.sharesAfter, row.ts));
         if (i === ordered.length - 1 || ordered[i + 1].ts !== ordered[i].ts) peak = Math.max(peak, total());
       }
       return peak;
@@ -1053,17 +1224,26 @@
       for (const ticker of ['ALL', ...tickers]) {
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'tab' + (ticker === state.ticker ? ' active' : '');
+        button.className = 'tab' + (state.panel === 'trades' && ticker === state.ticker ? ' active' : '');
         button.textContent = ticker;
         button.addEventListener('click', () => {
+          state.panel = 'trades';
           state.ticker = ticker;
           GM_setValue(KEY.ticker, ticker);
           render();
         });
         tabs.appendChild(button);
       }
+      const holdingsTab = document.createElement('button');
+      holdingsTab.type = 'button';
+      holdingsTab.className = 'tab holdings-tab' + (state.panel === 'holdings' ? ' active' : '');
+      holdingsTab.textContent = 'Holdings';
+      holdingsTab.addEventListener('click', openHoldings);
+      tabs.appendChild(holdingsTab);
+      // Holdings shows totals for all stocks.
+      const activeTicker = state.panel === 'holdings' ? 'ALL' : state.ticker;
 
-      const stockRows = all.filter(row => state.ticker === 'ALL' || row.ticker === state.ticker);
+      const stockRows = all.filter(row => activeTicker === 'ALL' || row.ticker === activeTicker);
       const shown = stockRows.filter(row =>
         action.value === 'ALL' ? true :
           action.value === 'MISSING' ? row.action === 'SELL' && row.cost == null :
@@ -1080,7 +1260,7 @@
         profit: complete.reduce((sum, row) => sum + row.profit, 0),
         fee: sells.reduce((sum, row) => sum + row.fee, 0),
         bought: stockRows.filter(row => row.action === 'BUY').reduce((sum, row) => sum + row.spent, 0),
-        capital: peakCapital(stockRows)
+        capital: peakCapital(stockRows, view.from, exclusionsByTicker())
       };
       const percent = (value) => value == null ? '—' : (value > 0 ? '+' : '') +
         value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
@@ -1091,7 +1271,7 @@
         ['Sell Proceeds', totals.net, 'What those sales paid out after the 0.1% fee'],
         ['Profit', totals.profit, 'Sell proceeds minus buy cost. ROI is profit on your capital; per trade is profit on buy cost', true],
         ['Fees Paid', totals.fee, 'Sale fees on every sell in this range'],
-        ['Capital', totals.capital, 'The most money you had invested at once in the stocks traded in this range (at cost)']
+        ['Capital', totals.capital, 'The most money you had invested at once in the stocks traded in this range (at cost), not counting holdings you exclude']
       ]) {
         const card = document.createElement('div');
         card.className = 'card' + (special ? ' profit' : '');
@@ -1118,7 +1298,7 @@
 
       const missingBox = find('#tsl-missing');
       missingBox.replaceChildren();
-      missingBox.hidden = !incomplete;
+      missingBox.hidden = !incomplete || state.panel !== 'trades';
       if (incomplete) {
         const text = document.createElement('span');
         text.textContent = quantity(incomplete) + (incomplete === 1 ? ' sell is' : ' sells are') +
@@ -1130,7 +1310,7 @@
       }
 
       const positions = [...ledger.holdings.entries()]
-        .filter(([ticker, lot]) => lot.shares > 0 && (state.ticker === 'ALL' || ticker === state.ticker))
+        .filter(([ticker, lot]) => lot.shares > 0 && state.panel === 'trades' && (state.ticker === 'ALL' || ticker === state.ticker))
         .sort((a, b) => a[0].localeCompare(b[0]));
       const positionBox = find('#tsl-positions');
       positionBox.replaceChildren();
@@ -1161,6 +1341,12 @@
 
       const results = find('#tsl-results');
       results.replaceChildren();
+      page.classList.toggle('holdings-view', state.panel === 'holdings');
+      if (state.panel === 'holdings') {
+        state.shown = [];
+        renderHoldings(results);
+        return;
+      }
       if (!shown.length) {
         const note = document.createElement('div');
         note.className = 'note';
@@ -1284,6 +1470,11 @@
           await importRange(key, signup, view.to, update => setProgress(update.percent, update.message));
         setProgress(null, 'Loading stock names…');
         state.stockMap = await stockMapFor(key, setStatus);
+        try {
+          await holdingsFor(key, setStatus);
+        } catch (error) {
+          if (error instanceof Cancelled) throw error;
+        }
         render();
         setStatus(view.label + ': ' + result.added + ' new trades cached in ' +
           result.requests + ' API requests.');
@@ -1422,7 +1613,7 @@
         app: BACKUP_APP, format: 1, exported: now(),
         signup: Number(GM_getValue(KEY.signup, 0)) || null,
         coverage: coverage(), logs,
-        manual: readObject(KEY.manual), stockMap: readObject(KEY.stockMap)
+        manual: readObject(KEY.manual), stockMap: readObject(KEY.stockMap), excluded: readObject(KEY.excluded)
       };
       downloadFile('torn-stock-ledger-backup-' + stamp(now()).slice(0, 10) + '.json',
         JSON.stringify(data), 'application/json');
@@ -1487,8 +1678,15 @@
           const acronym = typeof stock === 'string' ? stock : stock?.acronym;
           const name = typeof stock === 'string' ? stock : stock?.name;
           if (!/^\d{1,6}$/.test(id) || typeof acronym !== 'string' || !acronym || acronym.length > 12) continue;
-          if (!stockMap[id]) stockMap[id] = { acronym, name: typeof name === 'string' ? name.slice(0, 80) : acronym };
+          const block = Number(stock?.block);
+          if (!stockMap[id]) stockMap[id] = { acronym, name: typeof name === 'string' ? name.slice(0, 80) : acronym,
+            ...(Number.isSafeInteger(block) && block >= 0 ? { block } : {}) };
         }
+        const excludedNow = readObject(KEY.excluded);
+        for (const [id, on] of Object.entries(data.excluded && typeof data.excluded === 'object' ? data.excluded : {})) {
+          if (on === true && /^\d{1,6}:[A-Za-z0-9_-]{1,40}$/.test(id)) excludedNow[id] = true;
+        }
+        GM_setValue(KEY.excluded, excludedNow);
         const signup = Number(data.signup);
         if (!Number(GM_getValue(KEY.signup, 0)) && Number.isSafeInteger(signup) && signup > 0 && signup <= now()) {
           GM_setValue(KEY.signup, signup);

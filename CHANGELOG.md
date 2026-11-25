@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.0 — 2026-11-25
+
+### New
+- **Holdings tab** (after the stock tabs): your current holdings as Torn lists them, one entry per purchase, with Torn's own buy price and date. Holdings that are exactly a stock's benefit block are tagged **Block**.
+- **Exclude** on each holding leaves it out of **Capital** (and so out of ROI) from the time it was bought. Use it for benefit blocks and long-term holdings, so Capital only counts the money you trade with. Other holdings in the same stock still count.
+- Holdings load with each Refresh or Full History, or when you open the tab and they're over 5 minutes old (one API call). Excluding or including a holding makes no API calls.
+- Backup and Restore include your excluded holdings.
+
+### Key access
+- The Holdings tab needs **user → stocks** on a Custom key. Without it, everything else works as before and the tab says what to add.
+
 ## 1.4.0 — 2026-11-25
 
 ### New
